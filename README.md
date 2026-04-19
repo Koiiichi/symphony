@@ -1,8 +1,8 @@
-# Symphony-Lite
+# Symphony
 
 [![Python Version](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
-Symphony-Lite is an intelligent orchestration tool that automatically detects your project stack, manages servers, and coordinates AI agents to refine your applications through visual audits and code improvements.
+Symphony is an intelligent orchestration tool that automatically detects your project stack, manages servers, and coordinates AI agents to refine your applications through visual audits and code improvements.
 
 ## Table of Contents
 
@@ -38,7 +38,7 @@ Symphony-Lite is an intelligent orchestration tool that automatically detects yo
 1. Clone the repository:
    ```bash
    git clone <repository-url>
-   cd symphony-lite
+   cd Symphony
    ```
 
 2. Create and activate a virtual environment (recommended):
@@ -142,17 +142,17 @@ For convenience, add an alias to your shell configuration:
 
 **macOS/Linux (bash/zsh):**
 ```bash
-alias symphony="python /path/to/symphony-lite/symphony.py"
+alias symphony="python /path/to/Symphony/symphony.py"
 ```
 
 **Windows Command Prompt:**
 ```cmd
-doskey symphony=py C:\path\to\symphony-lite\symphony.py $*
+doskey symphony=py C:\path\to\Symphony\symphony.py $*
 ```
 
 **Windows PowerShell:**
 ```powershell
-function symphony { py C:\path\to\symphony-lite\symphony.py $args }
+function symphony { py C:\path\to\Symphony\symphony.py $args }
 ```
 
 ## Testing
