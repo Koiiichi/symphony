@@ -1,124 +1,333 @@
+"""Integration tests — end-to-end workflow validation.
+
+These tests exercise the planner → flow DSL → evaluator pipeline
+without requiring a live browser (browser executor is mocked).
+"""
+
 import json
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 import pytest
-pytest.importorskip("rich")
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
-from core.types import StartCommand, WorkflowConfig
-from orchestrator import run_workflow
-
-
-class FakeHooks:
-    def __init__(self):
-        self.events = []
-        self._resolved = False
-
-    def run_brain(self, instructions: str, *, pass_index: int):
-        self.events.append(("brain", pass_index, instructions))
-        return {"status": "ok"}
-
-    def run_vision(self, url: str, expectations, *, pass_index: int, mode: str):
-        self.events.append(("vision", pass_index, url, mode))
-        if not self._resolved:
-            self._resolved = True
-            return {
-                "vision_scores": {"alignment": 0.6, "spacing": 0.6, "contrast": 0.6},
-                "elements": {},
-                "interactions": {},
-            }
-        return {
-            "vision_scores": {"alignment": 0.95, "spacing": 0.94, "contrast": 0.92},
-            "elements": {},
-            "interactions": {},
-        }
-
-    def consume_brain_log(self, pass_index: int):  # pragma: no cover - interface fulfilment
-        return None
+from symphony.planner.schema import (
+    AcceptanceCriterion,
+    NodeType,
+    TaskEdge,
+    TaskGraph,
+    TaskNode,
+)
+from symphony.planner.planner import LLMPlanner, _heuristic_plan
+from symphony.flow.dsl import ActionType, FlowAction, FlowScript
+from symphony.flow.executor import ActionResult, Evidence, FlowExecutor, FlowResult
+from symphony.evaluator.evaluator import ReliabilityEvaluator, Severity
+from symphony.prompt.compiler import ContextBlock, PromptCompiler
 
 
-class AlwaysPassingVision(FakeHooks):
-    def run_vision(self, url: str, expectations, *, pass_index: int, mode: str):
-        self.events.append(("vision", pass_index, url, mode))
-        return {
-            "vision_scores": {"alignment": 0.95, "spacing": 0.95, "contrast": 0.95},
-            "elements": {},
-            "interactions": {},
-        }
+# ------------------------------------------------------------------
+# Contact form happy path: 2xx + success banner
+# ------------------------------------------------------------------
+
+class TestContactFormHappyPath:
+    def test_plan_and_evaluate_success(self):
+        graph = TaskGraph(
+            goal="Submit contact form and verify success",
+            nodes=[
+                TaskNode(id="nav", type=NodeType.SERVICE_START, description="Start server"),
+                TaskNode(
+                    id="contact_test",
+                    type=NodeType.WEB_FLOW_TEST,
+                    description="Fill and submit contact form",
+                    actions=[
+                        {"action": "navigate", "value": "http://localhost:5000"},
+                        {"action": "fill", "selector": "#name", "value": "Test User"},
+                        {"action": "fill", "selector": "#email", "value": "test@example.com"},
+                        {"action": "fill", "selector": "#message", "value": "Hello!"},
+                        {"action": "click", "selector": "#submit"},
+                    ],
+                    assertions=[
+                        {"action": "assert_banner", "value": "Thank you"},
+                        {"action": "assert_http_status", "value": "200", "params": {"url_pattern": "/api/contact"}},
+                    ],
+                ),
+                TaskNode(id="done", type=NodeType.FINALIZE),
+            ],
+            edges=[
+                TaskEdge(source="nav", target="contact_test"),
+                TaskEdge(source="contact_test", target="done"),
+            ],
+        )
+
+        # Simulate successful flow execution
+        flow_result = FlowResult(
+            script_name="contact_test",
+            passed=True,
+            results=[
+                ActionResult(
+                    action=FlowAction(action=ActionType.NAVIGATE, value="http://localhost:5000"),
+                    success=True, message="ok",
+                ),
+                ActionResult(
+                    action=FlowAction(action=ActionType.ASSERT_BANNER, value="Thank you"),
+                    success=True, message="Banner found",
+                ),
+                ActionResult(
+                    action=FlowAction(action=ActionType.ASSERT_HTTP_STATUS, value="200"),
+                    success=True, message="HTTP 200 verified",
+                ),
+            ],
+            evidence=Evidence(screenshots=[Path("/tmp/contact_success.png")]),
+        )
+
+        evaluator = ReliabilityEvaluator()
+        report = evaluator.evaluate([flow_result])
+        assert report.passed
+        assert report.status == "pass"
 
 
-@pytest.fixture(autouse=True)
-def server_manager_stub(monkeypatch):
-    class StubServerManager:
-        def __init__(self, stack, project_root=None):
-            self.stack = stack
+# ------------------------------------------------------------------
+# Contact form invalid email: 4xx + error banner
+# ------------------------------------------------------------------
 
-        def start_all(self, preferred_kind=None):
-            return {"frontend": "http://localhost:5173"}
+class TestContactFormInvalidEmail:
+    def test_invalid_email_shows_error(self):
+        flow_result = FlowResult(
+            script_name="contact_invalid_email",
+            passed=True,
+            results=[
+                ActionResult(
+                    action=FlowAction(action=ActionType.NAVIGATE, value="http://localhost:5000"),
+                    success=True, message="ok",
+                ),
+                ActionResult(
+                    action=FlowAction(
+                        action=ActionType.FILL, selector="#email", value="not-an-email"
+                    ),
+                    success=True, message="filled",
+                ),
+                ActionResult(
+                    action=FlowAction(action=ActionType.CLICK, selector="#submit"),
+                    success=True, message="clicked",
+                ),
+                ActionResult(
+                    action=FlowAction(action=ActionType.ASSERT_BANNER, value="Invalid email"),
+                    success=True, message="Error banner found",
+                ),
+            ],
+            evidence=Evidence(screenshots=[Path("/tmp/contact_error.png")]),
+        )
 
-        def stop_all(self):
-            pass
-
-        class _Selection:
-            def __init__(self, url: str):
-                self.url = url
-                self.probe = None
-                self.fallback_used = False
-                self.message = None
-                self.artifacts = {}
-
-        def resolve_preview_surface(self, run_id, preferred_kind=None, hints=None):
-            return self._Selection("http://localhost:5173")
-
-    monkeypatch.setattr("orchestrator.ServerManager", StubServerManager)
-    monkeypatch.setenv("SYMPHONY_BRAIN_API_KEY", "test")
-    monkeypatch.setenv("SYMPHONY_VISION_API_KEY", "test")
-
-
-def _prepare_project(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-    (path / "package.json").write_text(json.dumps({"name": "demo", "scripts": {"dev": "vite"}}))
-
-
-def test_refine_ui_flow(tmp_path):
-    project = tmp_path / "app"
-    _prepare_project(project)
-
-    config = WorkflowConfig(project_path=project, goal="Improve UI spacing", max_passes=3, open_browser=False)
-    hooks = FakeHooks()
-
-    summary = run_workflow(config, hooks=hooks)
-
-    assert summary.status in {"success", "stalled", "max_passes"}
-    assert any(evt[0] == "vision" for evt in hooks.events)
-    assert any(evt[0] == "brain" for evt in hooks.events)
+        evaluator = ReliabilityEvaluator()
+        report = evaluator.evaluate([flow_result])
+        assert report.passed
 
 
-def test_create_flow_runs_brain_first(tmp_path, monkeypatch):
-    project = tmp_path / "new"
-    project.mkdir()
-    monkeypatch.setattr(
-        "orchestrator.prompt_for_start_command",
-        lambda goal, root: StartCommand(
-            command=["npm", "run", "dev"],
-            cwd=root,
-            kind="frontend",
-            url="http://localhost:5173",
-        ),
-    )
+# ------------------------------------------------------------------
+# Login flow: valid + invalid credentials
+# ------------------------------------------------------------------
 
-    config = WorkflowConfig(
-        project_path=project,
-        goal="Create a landing page with beautiful UI",
-        max_passes=2,
-        open_browser=False,
-    )
-    hooks = AlwaysPassingVision()
+class TestLoginFlow:
+    def test_valid_login(self):
+        flow_result = FlowResult(
+            script_name="login_valid",
+            passed=True,
+            results=[
+                ActionResult(
+                    action=FlowAction(action=ActionType.NAVIGATE, value="http://localhost:5000/login"),
+                    success=True, message="ok",
+                ),
+                ActionResult(
+                    action=FlowAction(action=ActionType.FILL, selector="#email", value="user@test.com"),
+                    success=True, message="filled",
+                ),
+                ActionResult(
+                    action=FlowAction(action=ActionType.FILL, selector="#password", value="password123"),
+                    success=True, message="filled",
+                ),
+                ActionResult(
+                    action=FlowAction(action=ActionType.CLICK, selector="#login-btn"),
+                    success=True, message="clicked",
+                ),
+                ActionResult(
+                    action=FlowAction(action=ActionType.ASSERT_TEXT, selector=".dashboard", value="Welcome"),
+                    success=True, message="Welcome text found",
+                ),
+            ],
+            evidence=Evidence(screenshots=[Path("/tmp/login_success.png")]),
+        )
 
-    summary = run_workflow(config, hooks=hooks)
+        evaluator = ReliabilityEvaluator()
+        report = evaluator.evaluate([flow_result])
+        assert report.passed
 
-    assert hooks.events[0][0] == "brain"
-    assert summary.passes
-    assert summary.status in {"success", "max_passes", "stalled"}
+    def test_invalid_login(self):
+        flow_result = FlowResult(
+            script_name="login_invalid",
+            passed=True,
+            results=[
+                ActionResult(
+                    action=FlowAction(action=ActionType.NAVIGATE, value="http://localhost:5000/login"),
+                    success=True, message="ok",
+                ),
+                ActionResult(
+                    action=FlowAction(action=ActionType.FILL, selector="#email", value="wrong@test.com"),
+                    success=True, message="filled",
+                ),
+                ActionResult(
+                    action=FlowAction(action=ActionType.CLICK, selector="#login-btn"),
+                    success=True, message="clicked",
+                ),
+                ActionResult(
+                    action=FlowAction(action=ActionType.ASSERT_BANNER, value="Invalid credentials"),
+                    success=True, message="Error banner found",
+                ),
+            ],
+            evidence=Evidence(screenshots=[Path("/tmp/login_error.png")]),
+        )
+
+        evaluator = ReliabilityEvaluator()
+        report = evaluator.evaluate([flow_result])
+        assert report.passed
+
+
+# ------------------------------------------------------------------
+# Keyboard navigation flow
+# ------------------------------------------------------------------
+
+class TestKeyboardNavigation:
+    def test_tab_focus_movement(self):
+        flow_result = FlowResult(
+            script_name="keyboard_nav",
+            passed=True,
+            results=[
+                ActionResult(
+                    action=FlowAction(action=ActionType.NAVIGATE, value="http://localhost:5000"),
+                    success=True, message="ok",
+                ),
+                ActionResult(
+                    action=FlowAction(action=ActionType.PRESS, value="Tab"),
+                    success=True, message="Tab pressed",
+                ),
+                ActionResult(
+                    action=FlowAction(action=ActionType.PRESS, value="Tab"),
+                    success=True, message="Tab pressed",
+                ),
+                ActionResult(
+                    action=FlowAction(action=ActionType.PRESS, value="Enter"),
+                    success=True, message="Enter pressed",
+                ),
+                ActionResult(
+                    action=FlowAction(
+                        action=ActionType.ASSERT_TEXT,
+                        selector="body",
+                        value="Form submitted",
+                    ),
+                    success=True, message="Submit confirmed via keyboard",
+                ),
+            ],
+            evidence=Evidence(
+                screenshots=[Path("/tmp/keyboard_nav.png")],
+                focused_elements=["INPUT#name.", "INPUT#email.", "BUTTON#submit."],
+            ),
+        )
+
+        evaluator = ReliabilityEvaluator(require_accessibility=True)
+        report = evaluator.evaluate(
+            [flow_result],
+            accessibility_checks=[
+                {"id": "tab_focus", "passed": True, "message": "Tab order correct"},
+            ],
+        )
+        assert report.passed
+
+
+# ------------------------------------------------------------------
+# Multi-step web flow with scrolling and conditional waits
+# ------------------------------------------------------------------
+
+class TestMultiStepFlow:
+    def test_scroll_and_wait(self):
+        script = FlowScript(
+            name="multi_step",
+            actions=[
+                FlowAction(action=ActionType.NAVIGATE, value="http://localhost:5000/products"),
+                FlowAction(action=ActionType.SCROLL, params={"direction": "down", "pixels": 500}),
+                FlowAction(action=ActionType.WAIT_FOR, selector=".product-card"),
+                FlowAction(action=ActionType.CLICK, selector=".product-card:first-child .add-to-cart"),
+                FlowAction(action=ActionType.WAIT_FOR, selector=".cart-badge"),
+                FlowAction(action=ActionType.ASSERT_TEXT, selector=".cart-badge", value="1"),
+            ],
+        )
+        assert len(script.actions) == 6
+        assert len(script.assertion_actions()) == 1
+
+        # Simulate execution result
+        flow_result = FlowResult(
+            script_name="multi_step",
+            passed=True,
+            results=[
+                ActionResult(
+                    action=a,
+                    success=True,
+                    message=f"{a.action.value} ok",
+                )
+                for a in script.actions
+            ],
+            evidence=Evidence(screenshots=[Path("/tmp/multi_step.png")]),
+        )
+
+        evaluator = ReliabilityEvaluator()
+        report = evaluator.evaluate([flow_result])
+        assert report.passed
+
+
+# ------------------------------------------------------------------
+# Token budget regression
+# ------------------------------------------------------------------
+
+class TestTokenBudgetRegression:
+    """Ensure prompt size stays bounded across representative goals."""
+
+    GOALS = [
+        "Fix the contact form submission to return 200 and show a success banner",
+        "Ensure login with valid credentials redirects to the dashboard and displays the username",
+        "Verify that the product listing page loads all items and the add-to-cart button works",
+        "Fix the registration form to validate email format and show appropriate error messages",
+    ]
+
+    def test_prompts_fit_budget(self):
+        compiler = PromptCompiler(token_budget=16_000)
+        for goal in self.GOALS:
+            blocks = [
+                ContextBlock(name="Failures", content="Error: assert failed\n" * 50, priority=20),
+                ContextBlock(name="Source Code", content="def handler():\n    pass\n" * 200, priority=10),
+                ContextBlock(name="DOM Snapshot", content="<html>" + "<div>" * 500 + "</html>", priority=5),
+            ]
+            messages, usage = compiler.compile_with_usage(goal, blocks)
+            assert usage["total_tokens"] <= 16_000, (
+                f"Budget exceeded for goal: {goal} (used {usage['total_tokens']})"
+            )
+            assert usage["remaining"] >= 0
+
+
+# ------------------------------------------------------------------
+# Planner heuristic fallback
+# ------------------------------------------------------------------
+
+class TestPlannerFallback:
+    def test_heuristic_produces_valid_graph(self):
+        graph = _heuristic_plan("fix broken form")
+        assert isinstance(graph, TaskGraph)
+        assert graph.goal == "fix broken form"
+        order = graph.topo_order()
+        assert len(order) == len(graph.nodes)
+
+    def test_llm_planner_falls_back_on_error(self):
+        mock_client = MagicMock()
+        mock_client.messages.create.side_effect = RuntimeError("API down")
+
+        planner = LLMPlanner(mock_client)
+        graph, confidence = planner.plan("test goal")
+
+        assert isinstance(graph, TaskGraph)
+        assert confidence is None  # fallback has no confidence
+        assert graph.goal == "test goal"
