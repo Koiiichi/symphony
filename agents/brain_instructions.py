@@ -48,6 +48,7 @@ TASK:
 GUIDELINES:
 - DO NOT rewrite working code
 - DO NOT change the overall architecture
+- DO NOT create standalone one-off test scripts (e.g. test_*.py at project root) unless explicitly requested
 - DO make targeted improvements that align with the goal
 - DO ensure all changes are consistent with existing stack
 - Use write_code() only for files that need changes
@@ -106,6 +107,9 @@ PROCESS:
 2. Use write_code() to create frontend/package.json
 3. Use write_code() to create backend/app.py
 4. Use write_code() to create backend/requirements.txt
+
+IMPORTANT:
+- Do not create extra ad-hoc scripts outside this app structure unless explicitly asked.
 
 Start generating the complete application now.
 """

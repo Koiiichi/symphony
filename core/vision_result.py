@@ -40,6 +40,9 @@ class VisionInteraction:
     notes: Optional[str] = None
     id: Optional[str] = None
     attempted: Optional[bool] = None
+    http_status: Optional[int] = None
+    success_banner: Optional[bool] = None
+    error_banner: Optional[bool] = None
 
     @classmethod
     def from_payload(cls, data: Dict[str, Any]) -> "VisionInteraction":
@@ -55,6 +58,9 @@ class VisionInteraction:
             notes=_as_str(data.get("notes")),
             id=_as_str(data.get("id")),
             attempted=attempted_flag,
+            http_status=int(data["http_status"]) if isinstance(data.get("http_status"), (int, float)) else None,
+            success_banner=bool(data.get("success_banner")) if data.get("success_banner") is not None else None,
+            error_banner=bool(data.get("error_banner")) if data.get("error_banner") is not None else None,
         )
 
 
@@ -110,6 +116,10 @@ class VisionResult:
                     "selector": item.selector,
                     "ok": item.ok,
                     "notes": item.notes,
+                    "attempted": item.attempted,
+                    "http_status": item.http_status,
+                    "success_banner": item.success_banner,
+                    "error_banner": item.error_banner,
                 }
                 for item in self.interactions
             ],
@@ -126,6 +136,13 @@ class VisionResult:
     def to_observations(self) -> Dict[str, Any]:
         """Convert to the structure expected by the gate engine."""
 
+        score_source: Optional[str] = None
+        raw_scores = self.raw.get("scores")
+        if isinstance(raw_scores, dict):
+            candidate = raw_scores.get("source")
+            if isinstance(candidate, str) and candidate:
+                score_source = candidate
+
         scores = {
             "alignment": self.scores.get("alignment"),
             "spacing": self.scores.get("spacing"),
@@ -135,6 +152,8 @@ class VisionResult:
             key: (value if value is not None else 0.0)
             for key, value in scores.items()
         }
+        if score_source:
+            normalized_scores["source"] = score_source  # type: ignore[assignment]
 
         interactions_map: Dict[str, Dict[str, Any]] = {}
         for entry in self.interactions:
@@ -144,6 +163,9 @@ class VisionResult:
                 "ok": entry.ok,
                 "selector": entry.selector,
                 "notes": entry.notes,
+                "http_status": entry.http_status,
+                "success_banner": entry.success_banner,
+                "error_banner": entry.error_banner,
             }
 
         return {

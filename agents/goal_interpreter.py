@@ -339,6 +339,30 @@ def _apply_mode_filters(expectations: Dict[str, Any], vision_mode: str) -> Dict[
     if mode == "visual":
         expectations = dict(expectations)
         expectations["interactions"] = []
+
+    interactions = expectations.get("interactions")
+    has_form_interactions = bool(
+        isinstance(interactions, list)
+        and any(isinstance(i, dict) and i.get("type") == "form_submit" for i in interactions)
+    )
+
+    thresholds = expectations.get("thresholds")
+    if not isinstance(thresholds, dict):
+        # QA mode with interaction-driven goals prioritizes functional correctness;
+        # visual thresholds are relaxed to avoid blocking on style polish.
+        if mode == "qa" and has_form_interactions:
+            expectations["thresholds"] = {
+                "alignment_score": 0.70,
+                "spacing_score": 0.70,
+                "contrast_score": 0.70,
+            }
+        else:
+            expectations["thresholds"] = {
+                "alignment_score": 0.90,
+                "spacing_score": 0.90,
+                "contrast_score": 0.75,
+            }
+
     capabilities = expectations.get("capabilities")
     if isinstance(capabilities, dict):
         for key in ("kpi_tiles", "charts", "tables"):

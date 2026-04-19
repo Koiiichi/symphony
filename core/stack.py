@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import socket
+import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -51,15 +53,21 @@ _MARKER_FILES = [
     "docker-compose.yml",
     "Dockerfile",
     "manage.py",
+    "app.py",
+    "main.py",
+    "server.py",
     "index.html",
 ]
 
 _EXCLUDE_DIRS = {"node_modules", ".git", "artifacts", "venv", ".venv", "__pycache__", "drivers", ".idea"}
+_MAX_SCAN_DIRS = 1200
 
 
-def _collect_files(root: Path) -> List[Path]:
+def _collect_files(root: Path) -> tuple[List[Path], bool]:
     interesting: List[Path] = []
     seen: set = set()
+    scanned_dirs = 0
+    truncated = False
 
     # Root-level markers
     for name in _MARKER_FILES:
@@ -75,6 +83,10 @@ def _collect_files(root: Path) -> List[Path]:
             for sub in root.glob(pattern):
                 if not sub.is_dir():
                     continue
+                scanned_dirs += 1
+                if scanned_dirs > _MAX_SCAN_DIRS:
+                    truncated = True
+                    break
                 if any(part in _EXCLUDE_DIRS for part in sub.relative_to(root).parts):
                     continue
                 for marker in _MARKER_FILES:
@@ -82,15 +94,17 @@ def _collect_files(root: Path) -> List[Path]:
                     if candidate.exists() and candidate not in seen:
                         interesting.append(candidate)
                         seen.add(candidate)
+            if truncated:
+                break
         except OSError:
             continue
 
-    return interesting
+    return interesting, truncated
 
 
 def analyze_project(root: Path) -> StackInfo:
     root = root.resolve()
-    detected_files = _collect_files(root)
+    detected_files, truncated_scan = _collect_files(root)
     has_code = any(path.is_file() for path in detected_files)
 
     frameworks: List[str] = []
@@ -101,6 +115,10 @@ def analyze_project(root: Path) -> StackInfo:
     frontend_url = None
     backend_url = None
     notes: List[str] = []
+    if truncated_scan:
+        notes.append(
+            f"Marker scan truncated after {_MAX_SCAN_DIRS} directories; detection may be partial"
+        )
 
     config = load_config(root)
 
@@ -161,33 +179,70 @@ def analyze_project(root: Path) -> StackInfo:
                     )
                 )
 
-    # Python backend detection
-    if (root / "requirements.txt").exists() or (root / "pyproject.toml").exists():
+    # Python backend detection (supports nested backend folders)
+    python_markers = [
+        p for p in detected_files if p.name in {"requirements.txt", "pyproject.toml"}
+    ]
+    python_roots = {marker.parent for marker in python_markers}
+    if python_roots:
         backend = "python"
-        if (root / "requirements.txt").exists():
-            requirements_text = (root / "requirements.txt").read_text().lower()
-        else:
-            requirements_text = (root / "pyproject.toml").read_text().lower()
+    for py_root in sorted(python_roots):
+        try:
+            marker = (
+                py_root / "requirements.txt"
+                if (py_root / "requirements.txt").exists()
+                else py_root / "pyproject.toml"
+            )
+            requirements_text = marker.read_text().lower()
+        except OSError:
+            requirements_text = ""
+
+        local_frameworks: List[str] = []
         for framework, port in _DEFAULT_BACKEND_PORTS.items():
             if framework in requirements_text:
-                frameworks.append(framework)
+                if framework not in frameworks:
+                    frameworks.append(framework)
+                local_frameworks.append(framework)
                 backend_url = backend_url or f"http://localhost:{port}"
+
+        base_port = _guess_backend_port(local_frameworks or frameworks)
+        resolved_port = _pick_available_port(base_port)
+
         app_candidates = [
-            root / "app.py",
-            root / "main.py",
-            root / "server.py",
-            root / "manage.py",
+            py_root / "app.py",
+            py_root / "main.py",
+            py_root / "server.py",
+            py_root / "manage.py",
         ]
         for candidate in app_candidates:
             if candidate.exists():
+                if (
+                    "flask" in local_frameworks
+                    and base_port is not None
+                    and resolved_port is not None
+                    and resolved_port != base_port
+                ):
+                    command = [
+                        _python_executable(),
+                        "-m",
+                        "flask",
+                        "--app",
+                        candidate.name,
+                        "run",
+                    ]
+                    if resolved_port:
+                        command += ["--port", str(resolved_port)]
+                else:
+                    command = [_python_executable(), candidate.name]
+
                 start_commands.append(
                     StartCommand(
-                        command=[_python_executable(), str(candidate)],
-                        cwd=candidate.parent,
+                        command=command,
+                        cwd=py_root,
                         kind="backend",
-                        port=_guess_backend_port(frameworks),
-                        url=backend_url,
-                        description=f"python {candidate.name}",
+                        port=resolved_port,
+                        url=f"http://localhost:{resolved_port}" if resolved_port else backend_url,
+                        description=f"python {candidate.relative_to(root)}",
                     )
                 )
                 break
@@ -280,3 +335,41 @@ def _guess_backend_port(frameworks: List[str]) -> Optional[int]:
         if framework in _DEFAULT_BACKEND_PORTS:
             return _DEFAULT_BACKEND_PORTS[framework]
     return None
+
+
+def _port_in_use(port: int) -> bool:
+    if os.name != "nt":
+        try:
+            result = subprocess.run(
+                ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+            if result.returncode == 0:
+                return True
+            if result.returncode == 1:
+                return False
+        except Exception:
+            pass
+    try:
+        with socket.create_connection(("localhost", port), timeout=0.25):
+            return True
+    except PermissionError:
+        # Treat sandbox/network-denied states as "not available".
+        return True
+    except OSError:
+        return False
+
+
+def _pick_available_port(preferred: Optional[int]) -> Optional[int]:
+    if preferred is None:
+        return None
+    if not _port_in_use(preferred):
+        return preferred
+    # Fall back to the next nearby free port.
+    for candidate in range(preferred + 1, preferred + 21):
+        if not _port_in_use(candidate):
+            return candidate
+    return preferred

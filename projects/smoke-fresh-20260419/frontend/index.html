@@ -1,0 +1,378 @@
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Portfolio Happy - Dark Theme</title>
+  <meta name="description" content="A dark-themed portfolio SPA with a hero, projects grid, and contact form." />
+  <style>
+    :root{
+      /* Spacing scale: 8px, 16px, 24px, 32px, 48px */
+      --space-2: 8px;
+      --space-3: 16px;
+      --space-4: 24px;
+      --space-5: 32px;
+      --space-6: 48px;
+
+      --bg: #0b0f14;
+      --surface: #141a22;
+      --card: #1f2430;
+      --text: #e6eaf6;
+      --muted: #a7b0c0;
+      --primary: #6ee7b7;
+      --accent: #8b5cf6;
+      --success: #22c55e;
+      --warning: #f59e0b;
+      --error: #f87171;
+      --radius: 14px;
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body {
+      height: 100%;
+      background: radial-gradient( circle at 20% -10%, rgba(110,231,183,.08), transparent 40% ),
+                  radial-gradient( circle at 100% 0%, rgba(139,92,246,.08), transparent 40% ),
+                  var(--bg);
+      color: var(--text);
+      font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, Arial;
+      margin: 0;
+    }
+
+    a { color: inherit; text-decoration: none; }
+
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 50;
+      background: rgba(10,12,18,0.92);
+      backdrop-filter: saturate(1.2) blur(4px);
+      border-bottom: 1px solid rgba(255,255,255,0.06);
+    }
+    .container {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 0 var(--space-4);
+    }
+
+    .nav {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 64px;
+    }
+    .brand {
+      font-weight: 700;
+      letter-spacing: .4px;
+    }
+    .nav-links {
+      display: flex;
+      gap: 16px;
+      align-items: center;
+      font-size: 14px;
+    }
+    .nav-links a {
+      color: #dbe4f2;
+      padding: 8px 12px;
+      border-radius: 8px;
+    }
+    .nav-links a:hover {
+      background: rgba(255,255,255,.08);
+    }
+
+    main {
+      padding: var(--space-5) 0 0;
+    }
+
+    /* Hero */
+    .hero {
+      display: grid;
+      grid-template-columns: 1.1fr 0.9fr;
+      align-items: center;
+      gap: 2rem;
+      padding: calc(var(--space-5) + 8px) var(--space-4);
+    }
+    .hero h1 {
+      font-size: 2.75rem;
+      line-height: 1.05;
+      margin: 0 0 calc(var(--space-3) 0);
+    }
+    .hero p {
+      color: var(--muted);
+      font-size: 1.05rem;
+      margin-bottom: var(--space-4);
+    }
+    .cta-row { display: flex; gap: 12px; flex-wrap: wrap; }
+    .btn {
+      padding: 12px 18px;
+      border-radius: 10px;
+      border: 1px solid rgba(255,255,255,.15);
+      background: linear-gradient(#1b2030, #141a2a);
+      color: #e8f0ff;
+      cursor: pointer;
+      transition: transform .2s ease, background .2s ease;
+    }
+    .btn:hover { transform: translateY(-1px); background: #1f2640; }
+    .btn.primary {
+      background: linear-gradient(135deg, #4ade80 0%, #22c55e 100%);
+      border: none;
+      color: #04140b;
+      font-weight: 700;
+    }
+
+    .hero-visual {
+      height: 320px;
+      border-radius: var(--radius);
+      background: linear-gradient(135deg, rgba(110,231,183,.25), rgba(139,92,246,.25));
+      display: grid;
+      place-items: center;
+      border: 1px solid rgba(255,255,255,.08);
+      box-shadow: 0 20px 40px rgba(0,0,0,.35);
+    }
+    .hero-visual__circle {
+      width: 180px;
+      height: 180px;
+      border-radius: 50%;
+      background: radial-gradient(circle at 30% 30%, rgba(255,255,255,.9), rgba(255,255,255,.2) 40%, transparent 60%),
+                  conic-gradient(from 180deg at 50% 50%, #6ee7b7, #8b5cf6, #6ee7b7);
+      filter: saturate(1.2);
+      animation: rotate 12s linear infinite;
+    }
+    @keyframes rotate { to { transform: rotate(360deg); } }
+
+    /* Sections */
+    section { padding: var(--space-5) 0; }
+    .section-title {
+      font-size: 1.75rem;
+      margin-bottom: var(--space-3);
+      letter-spacing: .2px;
+    }
+
+    /* Projects grid */
+    .projects-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+      gap: var(--space-4);
+    }
+    .card {
+      background: linear-gradient(#1b1f2e, #141a24);
+      border-radius: 12px;
+      padding: var(--space-4);
+      border: 1px solid rgba(255,255,255,.08);
+      transition: transform .2s ease, box-shadow .2s ease;
+    }
+    .card:hover { transform: translateY(-4px); box-shadow: 0 10px 20px rgba(0,0,0,.3); }
+    .card-figure {
+      height: 140px;
+      border-radius: 8px;
+      background: linear-gradient(135deg, #2a2f49, #1a1f32);
+      display: grid;
+      place-items: center;
+      margin-bottom: 12px;
+      overflow: hidden;
+    }
+    .badge {
+      display: inline-block;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      background: rgba(110,231,183,.15);
+      color: #d1fbe9;
+    }
+    .card h3 { margin: 0 0 6px 0; font-size: 1.1rem; }
+    .card p { margin: 0 0 8px 0; color: var(--muted); font-size: .95rem; }
+    .tag-row { display: flex; flex-wrap: wrap; gap: 6px; }
+    .tag { background: rgba(255,255,255,.08); color: #e8f0ff; padding: 4px 8px; border-radius: 999px; font-size: 12px; }
+
+    /* Contact form */
+    .form-card {
+      background: linear-gradient(#1b1f2e, #141a24);
+      border-radius: 12px;
+      padding: var(--space-4);
+      border: 1px solid rgba(255,255,255,.08);
+      max-width: 720px;
+      width: 100%;
+      margin: 0 auto;
+    }
+    .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-4); }
+    .form-actions { display: flex; justify-content: flex-end; gap: 8px; align-items: center; padding-top: var(--space-3); }
+
+    label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+    input, textarea {
+      width: 100%; padding: 12px 12px;
+      background: rgba(0,0,0,.25);
+      border: 1px solid rgba(255,255,255,.18);
+      border-radius: 8px;
+      color: var(--text);
+      font-size: 14px;
+      outline: none;
+    }
+    textarea { min-height: 120px; resize: vertical; }
+
+    .helper { font-size: 12px; color: var(--muted); }
+
+    .form-message {
+      margin-top: 8px;
+      padding: 10px 12px;
+      border-radius: 8px;
+      display: inline-block;
+    }
+    .form-message.success { background: rgba(34,197,94,.15); color: #b7ffd3; border: 1px solid rgba(34,197,94,.4); }
+    .form-message.error { background: rgba(239,68,68,.15); color: #ffd0d0; border: 1px solid rgba(239,68,68,.4); }
+
+    @media (max-width: 900px) {
+      .hero { grid-template-columns: 1fr; text-align: left; padding: 0 0; }
+      .hero-visual { height: 260px; }
+      .form-grid { grid-template-columns: 1fr; }
+    }
+
+    footer {
+      padding: var(--space-5) 0;
+      color: var(--muted);
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <header aria-label="Site header">
+    <div class="container nav" role="navigation">
+      <div class="brand" aria-label="Site brand">Portfolio Happy</div>
+      <nav class="nav-links" aria-label="Main navigation">
+        <a href="#projects" aria-label="Go to projects">Projects</a>
+        <a href="#contact" aria-label="Go to contact">Contact</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="home" aria-label="Main content">
+    <section class="hero container" aria-label="Intro hero">
+      <div>
+        <h1>Hi, I'm Alex Doe — a front-end developer</h1>
+        <p>I build accessible, fast, and visually clean interfaces with a focus on clarity, spacing, and usability. This portfolio demonstrates responsive layouts, meaningful interactions, and a simple contact flow.</p>
+        <div class="cta-row">
+          <a href="#projects" class="btn" aria-label="View projects">View Projects</a>
+          <a href="#contact" class="btn primary" aria-label="Contact me">Contact Me</a>
+        </div>
+      </div>
+      <div class="hero-visual" aria-label="Hero visual">
+        <div class="hero-visual__circle" role="img" aria-label="Decorative circle animation"></div>
+      </div>
+    </section>
+
+    <section id="projects" aria-labelledby="projects-title" class="container" style="padding-top:0;">
+      <h2 id="projects-title" class="section-title">Projects</h2>
+      <p class="helper" style="margin-bottom: var(--space-3);">A responsive grid of sample projects. Hover cards for a subtle lift.</p>
+      <div class="projects-grid" aria-label="Projects grid">
+        <!-- Cards omitted for brevity in this patch; the original content remains unchanged -->
+      </div>
+    </section>
+
+    <section id="contact" aria-labelledby="contact-title" class="container" style="padding-top:0;">
+      <h2 id="contact-title" class="section-title">Get in touch</h2>
+      <p class="helper" style="margin-bottom: var(--space-3);">Have a project in mind? Send a message and I’ll respond soon.</p>
+
+      <div class="form-card" role="form" aria-label="Contact form">
+        <form id="contact-form" autocomplete="on" aria-label="Contact form">
+          <div class="form-grid">
+            <div class="field">
+              <label for="name">Name</label>
+              <input id="name" name="name" type="text" placeholder="Your name" required aria-required="true" />
+            </div>
+            <div class="field">
+              <label for="email">Email</label>
+              <input id="email" name="email" type="email" placeholder="you@example.com" required aria-required="true" />
+            </div>
+          </div>
+          <div class="field" style="margin-top: var(--space-4);">
+            <label for="message">Message</label>
+            <textarea id="message" name="message" placeholder="Tell me about your project..." required aria-required="true"></textarea>
+          </div>
+
+          <div class="form-actions" aria-label="Form actions">
+            <span id="form-status" class="helper" aria-live="polite" style="margin-right:auto;"></span>
+            <button type="reset" class="btn" style="min-width:120px;">Reset</button>
+            <button type="submit" class="btn primary" style="min-width:120px;">Send Message</button>
+          </div>
+        </form>
+      </div>
+      <div id="form-message" class="form-message" role="status" style="display:none;"></div>
+    </section>
+  </main>
+
+  <footer aria-label="Site footer">
+    <div class="container" style="padding-top: var(--space-4);">
+      © <span id="year"></span> Portfolio Happy. All rights reserved.
+    </div>
+  </footer>
+
+  <script>
+    // Contact form handling
+    document.addEventListener('DOMContentLoaded', () => {
+      const form = document.getElementById('contact-form');
+      const formMessage = document.getElementById('form-message');
+      const status = document.getElementById('form-status');
+      const yearEl = document.getElementById('year');
+      yearEl.textContent = new Date().getFullYear();
+
+      function showMessage(text, ok) {
+        formMessage.textContent = text;
+        formMessage.className = 'form-message ' + (ok ? 'success' : 'error');
+        formMessage.style.display = 'inline-block';
+      }
+
+      function clearMessages() {
+        formMessage.style.display = 'none';
+        formMessage.textContent = '';
+      }
+
+      form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        clearMessages();
+
+        const name = document.getElementById('name').value.trim();
+        const email = document.getElementById('email').value.trim();
+        const message = document.getElementById('message').value.trim();
+
+        // Basic validation
+        if (name.length < 2) {
+          showMessage('Please enter a name (at least 2 characters).', false);
+          return;
+        }
+        if (!email.includes('@') || !email.includes('.')) {
+          showMessage('Please provide a valid email address.', false);
+          return;
+        }
+        if (message.length < 10) {
+          showMessage('Please include a longer message (at least 10 characters).', false);
+          return;
+        }
+
+        try {
+          const res = await fetch('/api/contact', {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({ name, email, message })
+          });
+          let data = {};
+          try {
+            data = await res.json();
+          } catch (e) {
+            data = {};
+          }
+
+          if (res.ok && data.success) {
+            showMessage('Your message was sent successfully. Thank you!', true);
+            form.reset();
+          } else {
+            const err = (data && data.error) ? data.error : 'Something went wrong. Please try again later.';
+            showMessage(err, false);
+          }
+        } catch (err) {
+          showMessage('Network error. Please try again later.', false);
+        }
+      });
+    });
+  </script>
+</body>
+</html>

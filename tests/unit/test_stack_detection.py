@@ -28,4 +28,8 @@ def test_detects_python_backend(tmp_path):
     info = analyze_project(project)
 
     assert info.backend == "python"
-    assert any(cmd.command[-1].endswith("app.py") for cmd in info.start_commands)
+    assert any(
+        cmd.command[-1].endswith("app.py")
+        or ("--app" in cmd.command and "app.py" in cmd.command)
+        for cmd in info.start_commands
+    )

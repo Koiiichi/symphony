@@ -124,7 +124,13 @@ class GateRegistry:
             if interaction.get("expect_http_2xx", False):
                 status = actual.get("http_status")
                 if status is None:
-                    failures.append(f"{interaction_id}: http_status not captured")
+                    # Some webdriver environments cannot expose network logs.
+                    # If UI-level success is clearly observed, accept as a soft pass.
+                    ui_success = bool(actual.get("ok")) or (
+                        bool(actual.get("success_banner")) and not bool(actual.get("error_banner"))
+                    )
+                    if not ui_success:
+                        failures.append(f"{interaction_id}: http_status not captured")
                     continue
                 if not (200 <= status < 300):
                     failures.append(f"{interaction_id}: http_status {status} not 2xx")
@@ -234,7 +240,8 @@ def evaluate(
 def get_fix_instructions(
     expectations: Dict[str, Any],
     observations: Dict[str, Any],
-    failing_reasons: List[str]
+    failing_reasons: List[str],
+    preview_url: Optional[str] = None,
 ) -> str:
     """Generate targeted fix instructions from gate failures.
     
@@ -288,13 +295,21 @@ def get_fix_instructions(
             tips = [
                 f"### {interaction_id} Interaction Failure\n",
                 f"- {reason}\n",
+                "- Do not add standalone ad-hoc test scripts; fix existing app/frontend/backend code paths.\n",
                 "- Fix JavaScript form submission handler\n",
                 "- Ensure backend route processes POST requests correctly\n",
                 "- Display appropriate success/error messages\n",
             ]
             if "501" in reason:
+                contact_url_hint = (
+                    f"{preview_url.rstrip('/')}/api/contact"
+                    if preview_url and preview_url.startswith("http")
+                    else "http://localhost:<backend-port>/api/contact"
+                )
                 tips.append(
-                    "- A 501 status often means the request hit the static server. Point the frontend fetch to the Flask API (e.g. http://localhost:5000/api/contact) or proxy it through the backend.\n"
+                    "- A 501 status often means the request hit the static server. "
+                    f"Point the frontend fetch to the API route (e.g. `{contact_url_hint}`) "
+                    "or proxy it through the backend.\n"
                 )
             instructions.append("".join(tips))
         
@@ -330,9 +345,13 @@ def run_build_gate(
     # Python syntax check for backend projects
     backend = stack.get("backend")
     if backend and "python" in str(backend).lower():
-        py_files = list(project_root.glob("**/*.py"))
-        # Limit to a reasonable number of files to keep this fast
-        for py_file in py_files[:50]:
+        # Limit syntax checks to keep this lightweight on large repos.
+        max_files = 50
+        checked = 0
+        exclude_dirs = {"node_modules", ".git", "artifacts", "venv", ".venv", "__pycache__"}
+        for py_file in project_root.rglob("*.py"):
+            if any(part in exclude_dirs for part in py_file.parts):
+                continue
             try:
                 result = subprocess.run(
                     ["python", "-m", "py_compile", str(py_file)],
@@ -342,6 +361,9 @@ def run_build_gate(
                 )
                 if result.returncode != 0:
                     errors.append(f"{py_file.name}: {result.stderr.strip()}")
+                checked += 1
+                if checked >= max_files:
+                    break
             except Exception as exc:
                 errors.append(f"{py_file.name}: {exc}")
 

@@ -1,0 +1,12 @@
+{
+  "name": "portfolio-happy-frontend",
+  "version": "1.0.0",
+  "description": "Dark-themed portfolio frontend (static HTML/CSS/JS)",
+  "private": true,
+  "scripts": {
+    "start": "echo 'Frontend is served by backend Flask app in this project.'"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT"
+}

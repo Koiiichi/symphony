@@ -46,6 +46,16 @@ _ALLOWED_COMMANDS = frozenset({
     "pytest", "ruff", "eslint", "tsc", "prettier",
 })
 
+_ALLOWED_NEW_ROOT_PY_FILES = frozenset({
+    "app.py",
+    "main.py",
+    "server.py",
+    "manage.py",
+    "wsgi.py",
+    "asgi.py",
+    "setup.py",
+})
+
 
 def _sanitize_command(cmd: str, project_root: pathlib.Path) -> Tuple[List[str], Optional[str]]:
     """Parse and validate a shell command string.
@@ -138,6 +148,22 @@ def validate_path_safety(project_root: pathlib.Path, target_path: str) -> pathli
     return resolved
 
 
+def _is_disallowed_new_file(project_root: pathlib.Path, full_path: pathlib.Path) -> bool:
+    """Guardrail against ad-hoc script creation in project root."""
+    if full_path.exists():
+        return False
+    try:
+        rel = full_path.relative_to(project_root)
+    except ValueError:
+        return False
+
+    # Only enforce for root-level Python files.
+    if len(rel.parts) != 1 or full_path.suffix.lower() != ".py":
+        return False
+
+    return rel.name.lower() not in _ALLOWED_NEW_ROOT_PY_FILES
+
+
 def create_brain_agent(
     project_root: str | pathlib.Path,
     config: Optional[BrainConfig] = None,
@@ -179,6 +205,13 @@ def create_brain_agent(
         """
         try:
             full_path = validate_path_safety(project_root, path)
+            if _is_disallowed_new_file(project_root, full_path):
+                rel = full_path.relative_to(project_root)
+                return (
+                    "Blocked: Creating new root-level Python files is disabled by default. "
+                    f"Path '{rel}' was blocked. "
+                    "Use existing app files or place helpers under tests/ or scripts/."
+                )
             full_path.parent.mkdir(parents=True, exist_ok=True)
             
             with open(full_path, "w", encoding="utf-8") as f:

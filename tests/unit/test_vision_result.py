@@ -9,7 +9,16 @@ def test_parse_vision_payload_valid() -> None:
         "scores": {"alignment": 0.9, "spacing": 0.91, "contrast": 0.92},
         "accessibility": {"violations": 0, "target": "AA"},
         "interactions": [
-            {"id": "contact_submit", "action": "form_submit", "ok": True, "selector": "#contact"}
+            {
+                "id": "contact_submit",
+                "action": "form_submit",
+                "ok": True,
+                "selector": "#contact",
+                "attempted": True,
+                "http_status": 200,
+                "success_banner": True,
+                "error_banner": False,
+            }
         ],
         "issues": [],
         "suggestions": [],
@@ -22,6 +31,8 @@ def test_parse_vision_payload_valid() -> None:
     observations = result.to_observations()
     assert observations["vision_scores"]["alignment"] == 0.9
     assert "contact_submit" in observations["interactions"]
+    assert observations["interactions"]["contact_submit"]["http_status"] == 200
+    assert observations["interactions"]["contact_submit"]["success_banner"] is True
 
 
 def test_parse_vision_payload_with_noise() -> None:

@@ -53,19 +53,64 @@ def _is_pid_alive(pid: int) -> bool:
         return False
 
 
-def _kill_stale_pids(pids: List[int]) -> List[int]:
-    """Terminate stale PIDs.  Returns PIDs that were actually alive and killed."""
+def _pid_cwd(pid: int) -> Optional[Path]:
+    """Best-effort process cwd lookup for ownership checks."""
+    if os.name == "nt":
+        return None
+    try:
+        # lsof output with -Fn prefixes "n" on name paths.
+        result = subprocess.run(
+            ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if result.returncode != 0:
+            return None
+        for line in result.stdout.splitlines():
+            if line.startswith("n"):
+                cwd = line[1:].strip()
+                if cwd:
+                    return Path(cwd)
+    except Exception:
+        return None
+    return None
+
+
+def _pid_belongs_to_project(pid: int, project_root: Path) -> bool:
+    """Return True only when the process cwd lives under this project root."""
+    cwd = _pid_cwd(pid)
+    if cwd is None:
+        return False
+    try:
+        root = project_root.resolve()
+        cwd = cwd.resolve()
+        return cwd == root or root in cwd.parents
+    except Exception:
+        return False
+
+
+def _kill_stale_pids(pids: List[int], project_root: Path) -> List[int]:
+    """Terminate stale PIDs that belong to this project."""
     killed = []
     for pid in pids:
-        if _is_pid_alive(pid):
-            try:
-                if os.name != "nt":
-                    os.killpg(pid, signal.SIGTERM)
+        if not _is_pid_alive(pid):
+            continue
+        if not _pid_belongs_to_project(pid, project_root):
+            continue
+        try:
+            if os.name != "nt":
+                pgid = os.getpgid(pid)
+                if pgid == pid:
+                    os.killpg(pgid, signal.SIGTERM)
                 else:
                     os.kill(pid, signal.SIGTERM)
-                killed.append(pid)
-            except (OSError, ProcessLookupError):
-                pass
+            else:
+                os.kill(pid, signal.SIGTERM)
+            killed.append(pid)
+        except (OSError, ProcessLookupError):
+            pass
     return killed
 
 
@@ -111,7 +156,7 @@ class ServerManager:
         """Kill any orphaned servers from a previous crashed run."""
         stale = _read_lockfile(self._lockfile)
         if stale:
-            killed = _kill_stale_pids(stale)
+            killed = _kill_stale_pids(stale, self._project_root)
             if killed:
                 time.sleep(0.5)
             _remove_lockfile(self._lockfile)

@@ -1,0 +1,106 @@
+{
+  "status": "pass",
+  "alignment_score": 0.9,
+  "spacing_score": 0.9,
+  "contrast_score": 0.9,
+  "visible_sections": [
+    "contact",
+    "hero",
+    "projects"
+  ],
+  "interaction": {
+    "attempted": true,
+    "http_status": 501,
+    "success_banner": true,
+    "error_banner": true,
+    "details": "Form submitted successfully",
+    "errors": [],
+    "contact_submitted": true
+  },
+  "a11y": {
+    "violations": 0,
+    "top_issues": [],
+    "wcag_level": "AA"
+  },
+  "playwright": {
+    "passed": true,
+    "failed_tests": [],
+    "total_tests": 0
+  },
+  "screens": [
+    {
+      "page": "initial_load",
+      "path": "artifacts\\run_20251014_005853\\step_1_initial_1760418676.png",
+      "timestamp": null
+    },
+    {
+      "page": "after_scroll",
+      "path": "artifacts\\run_20251014_005853\\step_2_scroll_1760418682.png",
+      "timestamp": null
+    },
+    {
+      "page": "after_submit",
+      "path": "artifacts\\run_20251014_005853\\step_3_submit_1760418694.png",
+      "timestamp": null
+    }
+  ],
+  "elements": {
+    "kpi_tiles": 0,
+    "charts": 0,
+    "tables": 0,
+    "filters": 0
+  },
+  "interactions": {
+    "contact_submit": {
+      "attempted": true,
+      "http_status": 501,
+      "success_banner": true,
+      "error_banner": true
+    }
+  },
+  "visited_urls": [
+    "http://localhost:3000"
+  ],
+  "vision_scores": {
+    "alignment": 0.9,
+    "spacing": 0.9,
+    "contrast": 0.9
+  },
+  "model_ids": {
+    "sensory": "gpt-4o",
+    "brain": "gpt-5-nano"
+  },
+  "expectations": {
+    "capabilities": {
+      "kpi_tiles": {
+        "min": 0
+      },
+      "charts": {
+        "min": 0
+      },
+      "tables": {
+        "min": 0
+      },
+      "filters": {
+        "required": false
+      }
+    },
+    "interactions": [
+      {
+        "id": "contact_submit",
+        "type": "form_submit",
+        "selector": "#contact",
+        "expect_http_2xx": true,
+        "expect_success_banner": true
+      }
+    ],
+    "thresholds": {
+      "alignment_score": 0.9,
+      "spacing_score": 0.9,
+      "contrast_score": 0.75
+    }
+  },
+  "failing_reasons": [
+    "contact_submit: http_status 501 not 2xx; contact_submit: error_banner shown"
+  ]
+}

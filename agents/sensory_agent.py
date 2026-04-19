@@ -86,10 +86,28 @@ def _save_step_screenshot(step_name: str, run_id: str = "default") -> str:
     return str(path)
 
 
+def _wait_until(predicate, timeout: float = 2.0, interval: float = 0.2) -> bool:
+    """Poll predicate until it returns True or timeout elapses."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if predicate():
+                return True
+        except Exception:
+            pass
+        time.sleep(interval)
+    return False
+
+
 def go_to_url(url: str) -> str:
     """Navigate to URL and wait for load."""
     helium.go_to(url)
-    time.sleep(2.0)
+    driver = helium.get_driver()
+    _wait_until(
+        lambda: driver.execute_script("return document.readyState") == "complete",
+        timeout=3.0,
+        interval=0.2,
+    )
     return f"Opened {url}"
 
 
@@ -100,11 +118,15 @@ def ensure_contact_present() -> str:
     for indicator in contact_indicators:
         if helium.Text(indicator).exists():
             helium.scroll_down(1200)
-            time.sleep(1.5)
+            _wait_until(lambda: helium.Text(indicator).exists(), timeout=1.0, interval=0.2)
             return f"Found and scrolled to contact section ({indicator})"
     
     helium.scroll_down(1200)
-    time.sleep(1.5)
+    _wait_until(
+        lambda: any(helium.Text(ind).exists() for ind in contact_indicators),
+        timeout=1.5,
+        interval=0.2,
+    )
     return "Scrolled down to explore page; contact section may be below fold"
 
 
@@ -206,8 +228,16 @@ def submit_contact_form(
         submit_clicked = click_target(submit_selectors)
         if not submit_clicked:
             errors.append("Could not find or click submit button")
-        
-        time.sleep(2.0)  # Wait for response
+
+        _wait_until(
+            lambda: (
+                _get_last_xhr_status("/api/contact") is not None
+                or _check_success_banner()
+                or _check_error_banner()
+            ),
+            timeout=3.0,
+            interval=0.25,
+        )
         
         contact_submitted = name_filled and email_filled and message_filled and submit_clicked
         
@@ -667,7 +697,11 @@ def _test_form_interaction(interaction_spec: dict) -> dict:
             try:
                 helium.click(f"{selector} button[type='submit']")
                 result["attempted"] = True
-                time.sleep(2.0)
+                _wait_until(
+                    lambda: _check_success_banner() or _check_error_banner(),
+                    timeout=2.5,
+                    interval=0.25,
+                )
                 
                 # Check for success/error indicators
                 driver = helium.get_driver()

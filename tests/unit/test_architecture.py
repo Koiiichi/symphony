@@ -38,6 +38,8 @@ def test_goal_interpreter():
     print(json.dumps(expectations, indent=2))
     assert len(expectations["interactions"]) >= 1
     assert any("contact" in i["id"] for i in expectations["interactions"])
+    assert expectations["thresholds"]["alignment_score"] <= 0.70
+    assert expectations["thresholds"]["spacing_score"] <= 0.70
     
     # Test 3: Landing page goal
     expectations = build_expectations(
@@ -49,6 +51,7 @@ def test_goal_interpreter():
     print("\n3. Landing Page Goal:")
     print(json.dumps(expectations, indent=2))
     assert expectations["capabilities"]["kpi_tiles"]["min"] == 0
+    assert expectations["thresholds"]["alignment_score"] >= 0.90
     
     print("\nGoal Interpreter: PASSED")
 
@@ -151,6 +154,49 @@ def test_gate_engine_handles_legacy_capability_shapes():
     }
 
     result = evaluate_gates(expectations, passing_observations)
+    assert result["passed"] is True
+    assert result["failing_reasons"] == []
+
+
+def test_gate_engine_uses_ui_success_when_http_status_missing():
+    expectations = {
+        "capabilities": {
+            "kpi_tiles": {"min": 0},
+            "charts": {"min": 0},
+            "tables": {"min": 0},
+            "filters": {"required": False},
+        },
+        "interactions": [
+            {
+                "id": "contact_submit",
+                "type": "form_submit",
+                "selector": "#contact",
+                "expect_http_2xx": True,
+                "expect_success_banner": True,
+            }
+        ],
+        "thresholds": {
+            "alignment_score": 0.70,
+            "spacing_score": 0.70,
+            "contrast_score": 0.70,
+        },
+    }
+
+    observations = {
+        "elements": {"kpi_tiles": 0, "charts": 0, "tables": 0, "filters": 0},
+        "interactions": {
+            "contact_submit": {
+                "attempted": True,
+                "http_status": None,
+                "success_banner": True,
+                "error_banner": False,
+                "ok": True,
+            }
+        },
+        "vision_scores": {"alignment": 0.80, "spacing": 0.80, "contrast": 0.80},
+    }
+
+    result = evaluate_gates(expectations, observations)
     assert result["passed"] is True
     assert result["failing_reasons"] == []
 

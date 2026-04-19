@@ -194,6 +194,9 @@ def _sensory_to_vision_payload(
                     "ok": attempted and success,
                     "notes": notes or None,
                     "attempted": attempted,
+                    "http_status": value.get("http_status"),
+                    "success_banner": bool(value.get("success_banner")),
+                    "error_banner": bool(value.get("error_banner")),
                 }
             )
     warnings = data.get("warnings") if isinstance(data.get("warnings"), list) else []
@@ -211,6 +214,11 @@ def _sensory_to_vision_payload(
             "alignment": data.get("alignment_score"),
             "spacing": data.get("spacing_score"),
             "contrast": data.get("contrast_score"),
+            "source": (
+                data.get("vision_scores", {}).get("source")
+                if isinstance(data.get("vision_scores"), dict)
+                else None
+            ),
         },
         "accessibility": {
             "violations": data.get("a11y", {}).get("violations") if isinstance(data.get("a11y"), dict) else None,
@@ -272,7 +280,7 @@ def _format_stalled_message(failing_reasons: list[str]) -> str:
     if failing_reasons:
         issues = ", ".join(failing_reasons)
         return (
-            "Run stopped because no progress was observed across 2 passes: "
+            "Run stopped because no progress was observed across repeated passes: "
             f"{issues}. Address them manually and try again."
         )
     return "Run stopped because progress stalled across multiple passes. Review the latest output and try again."
@@ -431,7 +439,8 @@ def run_workflow(
 
             if not detected_stack.start_commands:
                 tui.add_voice("No start command detected. Requesting manual command…")
-                manual = prompt_for_start_command(config.goal, project_path)
+                with tui.suspend_live():
+                    manual = prompt_for_start_command(config.goal, project_path)
                 detected_stack.start_commands.append(manual)
 
             tui.update_status("Servers", "STARTING")
@@ -629,6 +638,8 @@ def run_workflow(
                         # Checkpoint before brain writes code
                         checkpoint_label = f"symphony-pre-pass-{index}"
                         _active_checkpoint = create_checkpoint(project_path, checkpoint_label)
+                        if not _active_checkpoint:
+                            tui.add_sub_info("Checkpoint skipped (requires a clean git subtree)")
 
                         if pass_report is None and last_report is None:
                             instructions = get_generation_instructions(
@@ -636,6 +647,12 @@ def run_workflow(
                                 config.goal,
                                 _stack_to_dict(detected_stack),
                             )
+                            if preview_url:
+                                instructions += (
+                                    "\n\n## Runtime Context\n"
+                                    f"- Preview URL: {preview_url}\n"
+                                    f"- Contact API should be reachable at: {preview_url.rstrip('/')}/api/contact\n"
+                                )
                         else:
                             report_for_fix = pass_report or last_report
                             if isinstance(report_for_fix, VisionResult):
@@ -650,10 +667,13 @@ def run_workflow(
                                 expectations,
                                 report_dict,
                                 failing_reasons,
+                                preview_url=preview_url,
                             )
                             instructions = (
                                 f"You are improving pass {index}.\n"
                                 f"Goal: {config.goal}\n\n"
+                                f"Preview URL: {preview_url or 'unknown'}\n"
+                                f"Expected contact API: {(preview_url.rstrip('/') + '/api/contact') if preview_url else 'unknown'}\n\n"
                                 f"{instructions}\n"
                             )
                         tui.start_activity(
@@ -732,11 +752,12 @@ def run_workflow(
                 if failing_reasons:
                     current_cats = _extract_failure_categories(failing_reasons)
                     last_cats = _extract_failure_categories(last_failures or [])
-                    if current_cats == last_cats:
+                    same_reason_set = set(failing_reasons) == set(last_failures or [])
+                    if current_cats == last_cats and same_reason_set:
                         stagnation_counter += 1
                     else:
                         stagnation_counter = 0
-                    if stagnation_counter >= 1:
+                    if stagnation_counter >= 2:
                         summary.status = "stalled"
                         final_message = _format_stalled_message(failing_reasons)
                         summary.final_message = final_message

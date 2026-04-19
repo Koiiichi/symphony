@@ -67,6 +67,25 @@ class SymphonyTUI:
                 self._stop_heartbeat()
                 self._live = None
 
+    @contextmanager
+    def suspend_live(self):
+        """Temporarily pause live rendering (e.g., while collecting terminal input)."""
+        if not self._live:
+            yield self
+            return
+
+        live = self._live
+        self._stop_heartbeat()
+        self._live = None
+        live.stop()
+        try:
+            yield self
+        finally:
+            live.start(refresh=True)
+            self._live = live
+            self._start_heartbeat()
+            self._refresh()
+
     def set_header(self, **fields: str) -> None:
         self.header.update({k: str(v) for k, v in fields.items() if v is not None})
         self._refresh()

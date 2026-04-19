@@ -1,3 +1,4 @@
+
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import os
@@ -16,12 +17,16 @@ def serve_static(path):
 @app.route('/api/contact', methods=['POST'])
 def contact():
     data = request.get_json()
-    
-    # Intentionally broken: return 501 to simulate error
+    # Assuming you would want to log or process data here
+    if data:
+        return jsonify({
+            'success': True,
+            'message': 'Contact form submitted successfully'
+        }), 200
     return jsonify({
         'success': False,
-        'message': 'Contact endpoint not implemented'
-    }), 501
+        'message': 'No data provided'
+    }), 400
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)

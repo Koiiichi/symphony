@@ -1,0 +1,8 @@
+{
+  "cli_options": {
+    "detailed_log": true,
+    "max_passes": 2,
+    "open_browser": false,
+    "vision_mode": "qa"
+  }
+}
