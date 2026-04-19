@@ -57,11 +57,12 @@ Symphony is an intelligent orchestration tool that automatically detects your pr
    python -m pip install -r requirements.txt
    ```
 
-   > **Note**: If you encounter dependency conflicts:
-   > ```bash
-   > python -m pip cache purge
-   > python -m pip install --no-cache-dir -r requirements.txt
-   > ```
+> [!Note]
+> If you encounter dependency conflicts:
+> ```bash
+> python -m pip cache purge
+> python -m pip install --no-cache-dir -r requirements.txt
+> ```
 
 ## Quick Start
 
