@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import atexit
+import json as _json
 import os
+import signal
 import socket
 import subprocess
 import time
@@ -8,12 +11,62 @@ import contextlib
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from .stack import ensure_config_override
 from .types import StackInfo, StartCommand
+
+
+_LOCKFILE_NAME = ".symphony_servers.lock"
+
+
+def _read_lockfile(lockfile: Path) -> List[int]:
+    """Read PIDs from the lockfile, ignoring malformed entries."""
+    if not lockfile.exists():
+        return []
+    try:
+        data = _json.loads(lockfile.read_text())
+        return [int(pid) for pid in data.get("pids", []) if isinstance(pid, int)]
+    except Exception:
+        return []
+
+
+def _write_lockfile(lockfile: Path, pids: List[int]) -> None:
+    lockfile.parent.mkdir(parents=True, exist_ok=True)
+    lockfile.write_text(_json.dumps({"pids": pids}))
+
+
+def _remove_lockfile(lockfile: Path) -> None:
+    try:
+        lockfile.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _is_pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
+def _kill_stale_pids(pids: List[int]) -> List[int]:
+    """Terminate stale PIDs.  Returns PIDs that were actually alive and killed."""
+    killed = []
+    for pid in pids:
+        if _is_pid_alive(pid):
+            try:
+                if os.name != "nt":
+                    os.killpg(pid, signal.SIGTERM)
+                else:
+                    os.kill(pid, signal.SIGTERM)
+                killed.append(pid)
+            except (OSError, ProcessLookupError):
+                pass
+    return killed
 
 
 @dataclass
@@ -46,9 +99,31 @@ class ServerSelection:
 class ServerManager:
     """Start and stop project services based on detected commands."""
 
-    def __init__(self, stack: StackInfo) -> None:
+    def __init__(self, stack: StackInfo, project_root: Optional[Path] = None) -> None:
         self.stack = stack
         self.running: List[RunningProcess] = []
+        self._project_root = project_root or stack.root
+        self._lockfile = self._project_root / _LOCKFILE_NAME
+        self._cleanup_stale_processes()
+        atexit.register(self._atexit_cleanup)
+
+    def _cleanup_stale_processes(self) -> None:
+        """Kill any orphaned servers from a previous crashed run."""
+        stale = _read_lockfile(self._lockfile)
+        if stale:
+            killed = _kill_stale_pids(stale)
+            if killed:
+                time.sleep(0.5)
+            _remove_lockfile(self._lockfile)
+
+    def _atexit_cleanup(self) -> None:
+        """Safety net: terminate any still-running servers on interpreter exit."""
+        self.stop_all()
+
+    def _save_pids(self) -> None:
+        pids = [rp.process.pid for rp in self.running if rp.process.poll() is None]
+        if pids:
+            _write_lockfile(self._lockfile, pids)
 
     def plan(self) -> List[StartCommand]:
         return self.stack.start_commands
@@ -170,14 +245,17 @@ class ServerManager:
             if os.name == "nt" and cmd_list[0] in ["npm", "node", "npx"]:
                 cmd_list = [f"{cmd_list[0]}.cmd"] + cmd_list[1:]
             
-            proc = subprocess.Popen(
-                cmd_list,
+            popen_kwargs: Dict = dict(
                 cwd=str(command.cwd),
                 env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
             )
+            if os.name != "nt":
+                popen_kwargs["start_new_session"] = True
+
+            proc = subprocess.Popen(cmd_list, **popen_kwargs)
             self.running.append(RunningProcess(command=command, process=proc))
             if command.url:
                 urls[command.kind] = command.url
@@ -194,17 +272,25 @@ class ServerManager:
                 except Exception:
                     self.stop_all()
                     raise
+        self._save_pids()
         return urls
 
     def stop_all(self) -> None:
         for proc in self.running:
             if proc.process.poll() is None:
-                proc.process.terminate()
+                try:
+                    if os.name != "nt":
+                        os.killpg(os.getpgid(proc.process.pid), signal.SIGTERM)
+                    else:
+                        proc.process.terminate()
+                except (OSError, ProcessLookupError):
+                    proc.process.terminate()
                 try:
                     proc.process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     proc.process.kill()
         self.running.clear()
+        _remove_lockfile(self._lockfile)
 
     def resolve_preview_surface(
         self,

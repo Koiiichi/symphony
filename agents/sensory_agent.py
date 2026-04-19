@@ -56,6 +56,12 @@ from agents.sensory_contract import (
     Screenshot
 )
 
+VIEWPORTS = [
+    {"name": "mobile", "width": 360, "height": 812},
+    {"name": "tablet", "width": 768, "height": 1024},
+    {"name": "desktop", "width": 1280, "height": 900},
+]
+
 # Optional OpenAI import for vision scoring
 try:
     from openai import OpenAI
@@ -232,37 +238,81 @@ def submit_contact_form(
 
 def check_basic_accessibility() -> AccessibilityResult:
     """Perform basic accessibility checks.
-    
+
     Returns:
         AccessibilityResult with violations found
     """
     violations = []
-    
+
     try:
         driver = helium.get_driver()
-        
-        # Check for images without alt text
+
+        # Images without alt text
         images = driver.find_elements("css selector", "img:not([alt])")
         if images:
             violations.append(f"{len(images)} images missing alt text")
-        
-        # Check for buttons without accessible labels
+
+        # Buttons without accessible labels
         buttons = driver.find_elements("css selector", "button:not([aria-label]):empty")
         if buttons:
             violations.append(f"{len(buttons)} buttons missing accessible labels")
-        
-        # Check for form inputs without labels
+
+        # Form inputs without labels
         inputs = driver.find_elements("css selector", "input:not([aria-label]):not([id])")
         unlabeled = [inp for inp in inputs if not driver.find_elements("css selector", f"label[for='{inp.get_attribute('id')}']")]
         if unlabeled:
             violations.append(f"{len(unlabeled)} form inputs missing labels")
-        
+
+        # Heading hierarchy — skip-level headings (e.g. h1 → h3)
+        try:
+            heading_levels = [
+                int(el.tag_name[1])
+                for el in driver.find_elements("css selector", "h1,h2,h3,h4,h5,h6")
+            ]
+            for i in range(1, len(heading_levels)):
+                if heading_levels[i] - heading_levels[i - 1] > 1:
+                    violations.append(
+                        f"Heading hierarchy skip: h{heading_levels[i-1]} → h{heading_levels[i]}"
+                    )
+                    break
+        except Exception:
+            pass
+
+        # Missing <main> landmark
+        try:
+            main_elements = driver.find_elements("css selector", "main, [role='main']")
+            if not main_elements:
+                violations.append("Page missing <main> landmark")
+        except Exception:
+            pass
+
+        # Anchor links with non-descriptive text ("click here", "read more", etc.)
+        try:
+            _vague = {"click here", "here", "read more", "more", "link", "this"}
+            anchors = driver.find_elements("css selector", "a")
+            vague_count = sum(
+                1 for a in anchors
+                if a.text.strip().lower() in _vague and not a.get_attribute("aria-label")
+            )
+            if vague_count:
+                violations.append(f"{vague_count} links with non-descriptive text")
+        except Exception:
+            pass
+
+        # Suppressed focus outlines (outline:none / outline:0 without :focus-visible override)
+        try:
+            page_src = driver.page_source
+            if "outline: none" in page_src or "outline:none" in page_src or "outline: 0" in page_src:
+                violations.append("CSS may suppress focus outlines (outline:none detected)")
+        except Exception:
+            pass
+
     except Exception as e:
         violations.append(f"Error during a11y check: {str(e)}")
-    
+
     return AccessibilityResult(
         violations=len(violations),
-        top_issues=violations[:5]  # Top 5 issues
+        top_issues=violations[:5],
     )
 
 
@@ -399,15 +449,18 @@ def analyze_view_heuristic() -> dict:
         except:
             pass
     
-    # Basic scoring based on visible elements
+    # Basic scoring based on visible elements — capped at 0.75 (heuristics are imprecise)
+    _MAX_HEURISTIC = 0.75
     base_score = 0.6 + (len(visible_sections) * 0.1)
-    
+
     return {
-        "alignment_score": min(base_score + 0.1, 1.0),
-        "spacing_score": min(base_score, 1.0),
-        "contrast_score": min(base_score + 0.05, 1.0),
+        "alignment_score": min(base_score + 0.1, _MAX_HEURISTIC),
+        "spacing_score": min(base_score, _MAX_HEURISTIC),
+        "contrast_score": min(base_score + 0.05, _MAX_HEURISTIC),
         "visible_sections": visible_sections,
-        "warnings": []
+        "confidence": "low",
+        "source": "heuristic",
+        "warnings": ["Heuristic fallback used — scores capped at 0.75"],
     }
 
 
@@ -684,38 +737,60 @@ def inspect_site(
     try:
         # Start browser
         helium.start_chrome(headless=headless, options=opts)
-        
-        # Step 1: Initial page load
+
+        viewport_results: dict = {}
+
+        # Step 1: Multi-viewport visual capture (mobile → tablet → desktop)
+        used_vision_api = False
+        for vp in VIEWPORTS:
+            driver = helium.get_driver()
+            driver.set_window_size(vp["width"], vp["height"])
+
+            go_to_url(url)
+            if url not in visited_urls:
+                visited_urls.append(url)
+
+            vp_screen_path = _save_step_screenshot(f"vp_{vp['name']}", run_id)
+            vp_view = analyze_current_view()
+            warnings.extend(vp_view.pop("warnings", []) or [])
+            screenshots.append(Screenshot(page=f"{vp['name']}_load", path=vp_screen_path, viewport=vp["name"]))
+
+            vp_alignment = vp_view.get("alignment_score", 0.7)
+            vp_spacing = vp_view.get("spacing_score", 0.7)
+            vp_contrast = vp_view.get("contrast_score", 0.7)
+
+            alignment_scores.append(vp_alignment)
+            spacing_scores.append(vp_spacing)
+            contrast_scores.append(vp_contrast)
+            all_visible_sections.update(vp_view.get("visible_sections", []))
+
+            if vp_view.get("source") == "vision_api":
+                used_vision_api = True
+
+            viewport_results[vp["name"]] = {
+                "alignment_score": vp_alignment,
+                "spacing_score": vp_spacing,
+                "contrast_score": vp_contrast,
+                "source": vp_view.get("source", "heuristic"),
+                "visible_sections": vp_view.get("visible_sections", []),
+            }
+
+        # Remainder of inspection at desktop resolution
+        driver = helium.get_driver()
+        driver.set_window_size(1280, 900)
         go_to_url(url)
-        visited_urls.append(url)
-        screen1_path = _save_step_screenshot("1_initial", run_id)
-        screen1 = analyze_current_view()
-        warnings.extend(screen1.pop("warnings", []) or [])
-        screenshots.append(Screenshot(page="initial_load", path=screen1_path))
-        
-        alignment_scores.append(screen1.get("alignment_score", 0.7))
-        spacing_scores.append(screen1.get("spacing_score", 0.7))
-        contrast_scores.append(screen1.get("contrast_score", 0.7))
-        all_visible_sections.update(screen1.get("visible_sections", []))
-        
+
         # Step 2: Explore and scroll
         ensure_contact_present()
         screen2_path = _save_step_screenshot("2_scroll", run_id)
-        screen2 = analyze_current_view()
-        warnings.extend(screen2.pop("warnings", []) or [])
-        screenshots.append(Screenshot(page="after_scroll", path=screen2_path))
-        
-        alignment_scores.append(screen2.get("alignment_score", 0.7))
-        spacing_scores.append(screen2.get("spacing_score", 0.7))
-        contrast_scores.append(screen2.get("contrast_score", 0.7))
-        all_visible_sections.update(screen2.get("visible_sections", []))
-        
+        screenshots.append(Screenshot(page="after_scroll", path=screen2_path, viewport="desktop"))
+
         # Count elements for generic capabilities
         elements = _count_elements()
-        
+
         # Default interaction result
         interaction = InteractionResult()
-        
+
         # Test interactions from expectations (in qa and hybrid modes)
         interactions_results = {}
         if mode.lower() in ("qa", "hybrid"):
@@ -737,7 +812,7 @@ def inspect_site(
                 }
         else:
             warnings.append("Interactive checks skipped in visual-only mode")
-        
+
         # Verify expected features exist on the page
         expected_features = expectations.get("expected_features", [])
         feature_results = _verify_features(expected_features)
@@ -746,42 +821,37 @@ def inspect_site(
                 detail = feature_results["details"].get(missing_id, {})
                 desc = detail.get("description", missing_id)
                 warnings.append(f"Missing expected feature: {desc}")
-        
-        # Step 3: Final analysis after interaction
+
+        # Step 3: Final screenshot after interactions
         screen3_path = _save_step_screenshot("3_submit", run_id)
         screen3 = analyze_current_view()
         warnings.extend(screen3.pop("warnings", []) or [])
-        screenshots.append(Screenshot(page="after_submit", path=screen3_path))
-        
-        alignment_scores.append(screen3.get("alignment_score", 0.7))
-        spacing_scores.append(screen3.get("spacing_score", 0.7))
-        contrast_scores.append(screen3.get("contrast_score", 0.7))
-        all_visible_sections.update(screen3.get("visible_sections", []))
-        
-        # Step 4: Basic accessibility check
+        screenshots.append(Screenshot(page="after_submit", path=screen3_path, viewport="desktop"))
+
+        # Don't feed the post-interaction screenshot into viewport scores —
+        # it would inflate final numbers relative to the per-viewport baseline.
+
+        if screen3.get("source") == "vision_api":
+            used_vision_api = True
+
+        # Step 4: Accessibility check at desktop
         a11y = check_basic_accessibility()
-        
-        # Aggregate scores (use max to be lenient)
-        final_alignment = max(alignment_scores) if alignment_scores else 0.7
-        final_spacing = max(spacing_scores) if spacing_scores else 0.7
-        final_contrast = max(contrast_scores) if contrast_scores else 0.7
-        
-        # Check if any analysis used Vision API
-        used_vision_api = any(
-            s.get("source") == "vision_api" 
-            for s in [screen1, screen2, screen3]
-        )
-        
+
+        # Aggregate using minimum across viewports (weakest link wins)
+        final_alignment = min(alignment_scores) if alignment_scores else 0.7
+        final_spacing = min(spacing_scores) if spacing_scores else 0.7
+        final_contrast = min(contrast_scores) if contrast_scores else 0.7
+
         # Build vision scores
         vision_scores = {
             "alignment": final_alignment,
             "spacing": final_spacing,
             "contrast": final_contrast,
-            "source": "vision_api" if used_vision_api else "heuristic"
+            "source": "vision_api" if used_vision_api else "heuristic",
         }
-        
-        # Determine status based on quality gates
-        deduped_warnings = []
+
+        # Deduplicate warnings
+        deduped_warnings: list = []
         for warning in warnings:
             if warning and warning not in deduped_warnings:
                 deduped_warnings.append(warning)
@@ -804,12 +874,13 @@ def inspect_site(
             expectations=expectations,
             warnings=deduped_warnings,
             feature_verification=feature_results,
+            viewport_results=viewport_results,
         )
-        
+
         # Update status based on gates
         if not report.passes_all_gates():
             report.status = "needs_fix"
-        
+
         return report
         
     except Exception as e:

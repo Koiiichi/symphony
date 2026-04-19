@@ -14,7 +14,7 @@ class TestContactFormAPI(unittest.TestCase):
     def test_invalid_email(self):
         response = requests.post(self.BASE_URL, json={"name": "John Doe", "email": "invalid-email", "message": "Hello!"})
         self.assertEqual(response.status_code, 400)  # Assuming 400 indicates a bad request
-        self.assertIn("Missing required fields", response.json()['error'])  # Adjust based on actual error message
+        self.assertIn("Invalid email format", response.json()['error'])  # Changed to the actual error message
 
     def test_empty_message(self):
         response = requests.post(self.BASE_URL, json={"name": "John Doe", "email": "john.doe@example.com", "message": ""})

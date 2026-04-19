@@ -6,10 +6,11 @@ with configurable models. No global state, full isolation between concurrent run
 
 import os
 import pathlib
+import shlex
 import subprocess
 import sys
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 try:  # pragma: no cover - optional dependency
     from smolagents import CodeAgent, tool
@@ -34,6 +35,51 @@ except ModuleNotFoundError:  # pragma: no cover - fallback used in tests
         raise ModuleNotFoundError(
             "smolagents is required to load agent models. Install smolagents to enable agent execution."
         )
+
+
+_ALLOWED_COMMANDS = frozenset({
+    "python", "python3", "pip", "pip3",
+    "npm", "npx", "node", "yarn", "pnpm",
+    "cat", "ls", "echo", "mkdir", "cp", "mv", "rm", "touch",
+    "git", "find", "grep", "head", "tail", "wc", "sort", "uniq",
+    "curl", "wget",
+    "pytest", "ruff", "eslint", "tsc", "prettier",
+})
+
+
+def _sanitize_command(cmd: str, project_root: pathlib.Path) -> Tuple[List[str], Optional[str]]:
+    """Parse and validate a shell command string.
+
+    Returns (cmd_list, error).  error is ``None`` when the command is safe.
+    """
+    try:
+        parts = shlex.split(cmd)
+    except ValueError as exc:
+        return [], f"Failed to parse command: {exc}"
+
+    if not parts:
+        return [], "Empty command"
+
+    base = pathlib.Path(parts[0]).name.lower()
+    # Strip .cmd/.exe suffix for Windows compat
+    for suffix in (".cmd", ".exe"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+
+    if base not in _ALLOWED_COMMANDS:
+        return [], (
+            f"Command '{base}' is not in the allow-list.  "
+            f"Permitted: {', '.join(sorted(_ALLOWED_COMMANDS))}"
+        )
+
+    # Reject obvious shell metacharacters that slipped through shlex
+    dangerous = {"&&", "||", ";", "|", "`", "$(", "${"}
+    for part in parts:
+        for pattern in dangerous:
+            if pattern in part:
+                return [], f"Shell metacharacter '{pattern}' is not allowed in arguments"
+
+    return parts, None
 
 
 @dataclass
@@ -209,33 +255,42 @@ def create_brain_agent(
     @tool
     def run_command(cmd: str, cwd: str = ".") -> str:
         """Run a shell command within the project sandbox.
-        
+
+        Only commands in the allow-list may be executed (python, npm, git, etc.).
+
         Args:
             cmd: Command to execute
             cwd: Working directory relative to project root
-            
+
         Returns:
             Command output (stdout + stderr)
         """
         try:
             # Validate working directory
             work_dir = validate_path_safety(project_root, cwd)
-            
+
+            # Parse and validate
+            cmd_list, error = _sanitize_command(cmd, project_root)
+            if error:
+                return f"Blocked: {error}"
+
             # Use current interpreter to avoid venv mismatches
-            if cmd.startswith("python ") or cmd.startswith("pip "):
-                cmd = cmd.replace("python ", f'"{sys.executable}" ', 1)
-                cmd = cmd.replace("pip ", f'"{sys.executable}" -m pip ', 1)
-            
-            # Execute with timeout
+            base = pathlib.Path(cmd_list[0]).name.lower().removesuffix(".cmd").removesuffix(".exe")
+            if base in ("python", "python3"):
+                cmd_list[0] = sys.executable
+            elif base in ("pip", "pip3"):
+                cmd_list = [sys.executable, "-m", "pip"] + cmd_list[1:]
+
+            # Execute with timeout – shell=False for safety
             result = subprocess.run(
-                cmd,
+                cmd_list,
                 cwd=work_dir,
-                shell=True,
+                shell=False,
                 capture_output=True,
                 text=True,
-                timeout=config.timeout
+                timeout=config.timeout,
             )
-            
+
             output = result.stdout or result.stderr or "(no output)"
             return f"Command: {cmd}\nExit code: {result.returncode}\nOutput:\n{output}"
         except subprocess.TimeoutExpired:

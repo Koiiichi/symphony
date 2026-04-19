@@ -3,7 +3,6 @@ from __future__ import annotations
 from contextlib import contextmanager
 import threading
 import time
-from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -139,13 +138,13 @@ class SymphonyTUI:
         status_table.add_row(f"Heartbeat: {self._heartbeat_text}")
 
         voice = Table.grid(padding=0)
+        for line in self.voice_lines[-15:]:
+            voice.add_row(line)
         if self._active_activity:
             spinner_text = self._active_activity
             if self._activity_progress:
                 spinner_text += " – " + " | ".join(self._activity_progress[-3:])
             voice.add_row(Spinner(self._spinner_style, text=spinner_text))
-        for line in self.voice_lines[-15:]:
-            voice.add_row(line)
 
         items: List = [Panel(header_table, title="Symphony"), Panel(status_table, title="Status")]
 

@@ -52,7 +52,7 @@ class AlwaysPassingVision(FakeHooks):
 @pytest.fixture(autouse=True)
 def server_manager_stub(monkeypatch):
     class StubServerManager:
-        def __init__(self, stack):
+        def __init__(self, stack, project_root=None):
             self.stack = stack
 
         def start_all(self, preferred_kind=None):

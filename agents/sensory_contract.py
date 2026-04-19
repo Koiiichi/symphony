@@ -43,6 +43,11 @@ class PlaywrightResult:
     failed_tests: List[str] = field(default_factory=list)
     total_tests: int = 0
 
+    @property
+    def is_placeholder(self) -> bool:
+        """True when no real tests were executed (total_tests == 0)."""
+        return self.total_tests == 0
+
 
 @dataclass
 class Screenshot:
@@ -50,6 +55,7 @@ class Screenshot:
     page: str
     path: str
     timestamp: Optional[str] = None
+    viewport: Optional[str] = None
 
 
 @dataclass
@@ -79,7 +85,8 @@ class SensoryReport:
     failing_reasons: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
     feature_verification: Dict[str, Any] = field(default_factory=dict)  # Feature verification results
-    
+    viewport_results: Dict[str, Any] = field(default_factory=dict)  # Per-viewport score breakdown
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
         return {
@@ -101,6 +108,7 @@ class SensoryReport:
             "failing_reasons": self.failing_reasons,
             "warnings": self.warnings,
             "feature_verification": self.feature_verification,
+            "viewport_results": self.viewport_results,
         }
     
     def to_json(self) -> str:
@@ -168,7 +176,7 @@ class SensoryReport:
         if self.a11y.violations > thresholds["a11y_violations"]:
             failing.append(f"a11y_violations ({self.a11y.violations} > {thresholds['a11y_violations']})")
         
-        if not self.playwright.passed:
+        if not self.playwright.passed and not self.playwright.is_placeholder:
             failing.append(f"playwright_tests_failed ({len(self.playwright.failed_tests)} tests)")
         
         return failing

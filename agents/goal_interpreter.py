@@ -1,13 +1,17 @@
 """Goal Interpreter - Converts natural language goals into structured expectations.
 
-Uses gpt-5-nano to derive capability-based expectations from user goals.
+Uses gpt-4o-mini to derive capability-based expectations from user goals.
 This removes the need for hard-coded page types.
 """
 
 import json
+import logging
 import os
+import time
 from typing import Dict, Any, Optional
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 try:
     from openai import OpenAI
@@ -18,13 +22,15 @@ except ImportError:
 
 # Model-specific temperature constraints
 MODEL_TEMPERATURE_SUPPORT = {
-    "gpt-5-nano": 1.0,    # Only supports default temperature
-    "gpt-4o": 0.0,        # Supports low temperature
+    "gpt-4o": 0.0,
     "gpt-4o-mini": 0.0,
     "gpt-4-turbo": 0.0,
     "claude-3-opus": 0.0,
     "claude-3-sonnet": 0.0,
 }
+
+# Simple in-memory cache keyed on (goal, hint, stack_repr)
+_expectations_cache: Dict[str, Dict[str, Any]] = {}
 
 
 def get_model_temperature(model_id: str, desired_temp: float = 0.0) -> float:
@@ -90,18 +96,29 @@ def _build_expectations_llm(
     page_type_hint: Optional[str],
     stack: Optional[Dict[str, Any]]
 ) -> Dict[str, Any]:
-    """Use gpt-4o-mini to derive expectations from goal."""
-    
+    """Use gpt-4o-mini to derive expectations from goal.
+
+    Retries up to 3 times with exponential backoff.  Results are cached
+    in-memory so identical goals in multi-pass runs avoid redundant calls.
+    """
+
+    # Cache lookup
+    stack_key = json.dumps(stack, sort_keys=True) if stack else ""
+    cache_key = f"{goal}|{page_type_hint}|{stack_key}"
+    if cache_key in _expectations_cache:
+        logger.debug("Goal interpreter cache hit")
+        return _expectations_cache[cache_key]
+
     client = OpenAI(api_key=os.getenv("SYMPHONY_BRAIN_API_KEY"))
-    
+
     stack_info = ""
     if stack:
         stack_info = f"\nDetected stack: Frontend: {stack.get('frontend', 'unknown')}, Backend: {stack.get('backend', 'unknown')}"
-    
+
     hint_info = ""
     if page_type_hint:
         hint_info = f"\nPage type hint: {page_type_hint}"
-    
+
     prompt = f"""You are a requirements analyzer. Given a user goal for a web application, extract structured expectations.
 
 User Goal: {goal}{hint_info}{stack_info}
@@ -133,30 +150,42 @@ Guidelines:
 - Use meaningful interaction IDs like "contact_submit", "newsletter_signup", "login_form"
 """
 
-    # Get appropriate temperature for model (gpt-4o-mini supports low temperature)
     temperature = get_model_temperature("gpt-4o-mini", desired_temp=0.0)
-    
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "You are a requirements extraction specialist. Return only valid JSON."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=temperature,
-        max_completion_tokens=500
-    )
-    
-    content = response.choices[0].message.content.strip()
-    
-    if '{' in content and '}' in content:
-        start = content.find('{')
-        end = content.rfind('}') + 1
-        json_str = content[start:end]
-        expectations = json.loads(json_str)
-    else:
-        expectations = json.loads(content)
-    
-    return expectations
+
+    last_error: Optional[Exception] = None
+    for attempt in range(3):
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "You are a requirements extraction specialist. Return only valid JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=temperature,
+                max_completion_tokens=500,
+            )
+
+            content = response.choices[0].message.content.strip()
+
+            if '{' in content and '}' in content:
+                start = content.find('{')
+                end = content.rfind('}') + 1
+                json_str = content[start:end]
+                expectations = json.loads(json_str)
+            else:
+                expectations = json.loads(content)
+
+            _expectations_cache[cache_key] = expectations
+            return expectations
+
+        except Exception as exc:
+            last_error = exc
+            if attempt < 2:
+                delay = 2 ** attempt  # 1s, 2s
+                logger.warning("Goal interpreter attempt %d failed: %s – retrying in %ds", attempt + 1, exc, delay)
+                time.sleep(delay)
+
+    raise last_error  # type: ignore[misc]
 
 
 def _build_expectations_heuristic(
@@ -306,7 +335,8 @@ def _build_expectations_heuristic(
 
 def _apply_mode_filters(expectations: Dict[str, Any], vision_mode: str) -> Dict[str, Any]:
     mode = (vision_mode or "hybrid").lower()
-    if mode != "qa":
+    # Only strip interactions in visual-only mode; hybrid and qa both test forms
+    if mode == "visual":
         expectations = dict(expectations)
         expectations["interactions"] = []
     capabilities = expectations.get("capabilities")

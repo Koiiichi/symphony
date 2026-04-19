@@ -35,34 +35,56 @@ def _detect_package_json(root: Path) -> Optional[Dict[str, object]]:
     return None
 
 
+_MARKER_FILES = [
+    "package.json",
+    "vite.config.js",
+    "vite.config.ts",
+    "next.config.js",
+    "astro.config.mjs",
+    "tsconfig.json",
+    "requirements.txt",
+    "pyproject.toml",
+    "pom.xml",
+    "build.gradle",
+    "go.mod",
+    "Cargo.toml",
+    "docker-compose.yml",
+    "Dockerfile",
+    "manage.py",
+    "index.html",
+]
+
+_EXCLUDE_DIRS = {"node_modules", ".git", "artifacts", "venv", ".venv", "__pycache__", "drivers", ".idea"}
+
+
 def _collect_files(root: Path) -> List[Path]:
     interesting: List[Path] = []
-    for name in [
-        "package.json",
-        "vite.config.js",
-        "vite.config.ts",
-        "next.config.js",
-        "astro.config.mjs",
-        "tsconfig.json",
-        "requirements.txt",
-        "pyproject.toml",
-        "pom.xml",
-        "build.gradle",
-        "go.mod",
-        "Cargo.toml",
-        "docker-compose.yml",
-        "Dockerfile",
-        "manage.py",
-        "index.html",
-    ]:
+    seen: set = set()
+
+    # Root-level markers
+    for name in _MARKER_FILES:
         path = root / name
-        if path.exists():
+        if path.exists() and path not in seen:
             interesting.append(path)
-    for sub in root.iterdir():
-        if sub.is_dir() and sub.name not in {"node_modules", ".git", "artifacts", "venv", ".venv"}:
-            package = sub / "package.json"
-            if package.exists():
-                interesting.append(package)
+            seen.add(path)
+
+    # Scan 1–3 levels of subdirectories for marker files
+    for depth in range(1, 4):
+        pattern = "/".join(["*"] * depth)
+        try:
+            for sub in root.glob(pattern):
+                if not sub.is_dir():
+                    continue
+                if any(part in _EXCLUDE_DIRS for part in sub.relative_to(root).parts):
+                    continue
+                for marker in _MARKER_FILES:
+                    candidate = sub / marker
+                    if candidate.exists() and candidate not in seen:
+                        interesting.append(candidate)
+                        seen.add(candidate)
+        except OSError:
+            continue
+
     return interesting
 
 

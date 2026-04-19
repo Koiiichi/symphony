@@ -30,7 +30,8 @@ from core.types import (
     WorkflowConfig,
     WorkflowSummary,
 )
-from gates.engine import evaluate as evaluate_gates, get_fix_instructions as build_gate_fix_instructions
+from gates.engine import evaluate as evaluate_gates, get_fix_instructions as build_gate_fix_instructions, run_build_gate
+from core.rollback import create_checkpoint, restore_checkpoint, discard_checkpoint
 from core.vision_result import VisionResult, parse_vision_payload, write_raw_payload
 
 
@@ -253,6 +254,20 @@ def _format_success_message(goal: str, intent: Optional[IntentResult], summary: 
     return f"{base}{detail}. {tail}"
 
 
+def _extract_failure_categories(reasons: list[str]) -> set[str]:
+    """Extract category keys from gate failure strings.
+
+    ``"alignment_score: 0.70 < 0.90"`` → ``"alignment_score"``
+    ``"contact_submit: http_status 501 not 2xx"`` → ``"contact_submit"``
+    """
+    cats: set[str] = set()
+    for reason in reasons:
+        key = reason.split(":")[0].strip()
+        if key:
+            cats.add(key)
+    return cats
+
+
 def _format_stalled_message(failing_reasons: list[str]) -> str:
     if failing_reasons:
         issues = ", ".join(failing_reasons)
@@ -412,7 +427,7 @@ def run_workflow(
 
             _require_api_keys(agents_needed)
 
-            server_manager = ServerManager(detected_stack)
+            server_manager = ServerManager(detected_stack, project_root=project_path)
 
             if not detected_stack.start_commands:
                 tui.add_voice("No start command detected. Requesting manual command…")
@@ -504,6 +519,7 @@ def run_workflow(
             last_report: Optional[VisionResult] = None
             last_failures: Optional[list[str]] = None
             stagnation_counter = 0
+            _active_checkpoint: Optional[str] = None
 
             brain_in_plan = any(step.agent == "brain" for step in plan)
             pending_handoff: Optional[Tuple[str, str]] = None
@@ -538,7 +554,7 @@ def run_workflow(
                             spinner="pulsing_star",
                         )
                         tui.update_activity_progress(f"mode: {config.vision_mode}")
-                        tui.update_activity_progress("breakpoints: 360 | 768 | 1280")
+                        tui.update_activity_progress("viewports: 360 | 768 | 1280")
                         pass_report = None
                         raw_report = hooks.run_vision(
                             vision_url,
@@ -610,6 +626,10 @@ def run_workflow(
                             tui.stop_activity(message, icon=icon)
                             pending_handoff = None
 
+                        # Checkpoint before brain writes code
+                        checkpoint_label = f"symphony-pre-pass-{index}"
+                        _active_checkpoint = create_checkpoint(project_path, checkpoint_label)
+
                         if pass_report is None and last_report is None:
                             instructions = get_generation_instructions(
                                 str(project_path),
@@ -656,6 +676,14 @@ def run_workflow(
                         tui.stop_activity("Brain: Applied targeted fixes", icon="[brain]")
                         changes_made = True
                         tui.add_sub_info("Applied targeted fixes")
+
+                        # Build gate: catch syntax errors before running vision
+                        build_ok, build_errors = run_build_gate(project_path, _stack_to_dict(detected_stack))
+                        if not build_ok:
+                            for err in build_errors[:5]:
+                                tui.add_sub_info(f"Build error: {err}")
+                            tui.add_sub_info("Build gate failed — feeding errors back to brain")
+
                         has_follow_up_vision = any(
                             future_step.agent == "vision" for future_step in remaining_steps
                         )
@@ -677,10 +705,34 @@ def run_workflow(
                     summary.add_pass(pass_outcome)
 
                 if success:
+                    # Accept brain changes — discard checkpoint
+                    if _active_checkpoint:
+                        discard_checkpoint(project_path, _active_checkpoint)
+                        _active_checkpoint = None
                     break
 
+                # If brain made changes but things got worse, roll back
+                if (
+                    _active_checkpoint
+                    and changes_made
+                    and last_failures is not None
+                    and failing_reasons
+                    and len(failing_reasons) > len(last_failures)
+                ):
+                    restored = restore_checkpoint(project_path, _active_checkpoint)
+                    _active_checkpoint = None
+                    if restored:
+                        tui.add_sub_info("Regression detected — reverted brain changes")
+                        failing_reasons = list(last_failures)
+                elif _active_checkpoint:
+                    # Changes accepted (or no regression) — discard checkpoint
+                    discard_checkpoint(project_path, _active_checkpoint)
+                    _active_checkpoint = None
+
                 if failing_reasons:
-                    if last_failures == failing_reasons:
+                    current_cats = _extract_failure_categories(failing_reasons)
+                    last_cats = _extract_failure_categories(last_failures or [])
+                    if current_cats == last_cats:
                         stagnation_counter += 1
                     else:
                         stagnation_counter = 0

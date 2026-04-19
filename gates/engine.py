@@ -4,6 +4,8 @@ Evaluates expectations against sensory observations using composable predicates.
 This removes hard-coded page semantics from the orchestrator.
 """
 
+import subprocess
+from pathlib import Path
 from typing import Dict, Any, List, Callable, Tuple, Optional
 
 
@@ -310,3 +312,37 @@ def get_fix_instructions(
             )
     
     return "\n".join(instructions)
+
+
+def run_build_gate(
+    project_root: Path,
+    stack: Dict[str, Any],
+) -> Tuple[bool, List[str]]:
+    """Run a lightweight build/syntax check before vision is invoked.
+
+    Returns a ``(ok, errors)`` tuple where *ok* is True when the project
+    builds without errors and *errors* is a (possibly empty) list of
+    human-readable error strings.
+    """
+    project_root = Path(project_root)
+    errors: List[str] = []
+
+    # Python syntax check for backend projects
+    backend = stack.get("backend")
+    if backend and "python" in str(backend).lower():
+        py_files = list(project_root.glob("**/*.py"))
+        # Limit to a reasonable number of files to keep this fast
+        for py_file in py_files[:50]:
+            try:
+                result = subprocess.run(
+                    ["python", "-m", "py_compile", str(py_file)],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                if result.returncode != 0:
+                    errors.append(f"{py_file.name}: {result.stderr.strip()}")
+            except Exception as exc:
+                errors.append(f"{py_file.name}: {exc}")
+
+    return len(errors) == 0, errors
