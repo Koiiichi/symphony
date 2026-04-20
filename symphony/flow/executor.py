@@ -110,6 +110,7 @@ class FlowExecutor:
 
     def execute(self, script: FlowScript) -> FlowResult:
         """Run all actions in *script* sequentially, collecting evidence."""
+        self._inject_network_interceptor()
         results: list[ActionResult] = []
         combined_evidence = Evidence()
         all_passed = True
@@ -165,10 +166,29 @@ class FlowExecutor:
             return ActionResult(
                 action=action,
                 success=False,
-                message=str(exc),
+                message=self._format_error(exc, action),
                 elapsed_ms=elapsed,
                 evidence=evidence,
             )
+
+    @staticmethod
+    def _format_error(exc: Exception, action: FlowAction) -> str:
+        """Extract a human-readable message from Selenium exceptions."""
+        raw = str(exc)
+        # Selenium exceptions embed "Message: ...\nStacktrace:\n..." —
+        # strip the native chromedriver stacktrace, keep only the message.
+        if "Stacktrace:" in raw:
+            raw = raw.split("Stacktrace:")[0].strip()
+        # TimeoutException from WebDriverWait often has an empty Message.
+        msg = raw.removeprefix("Message:").strip()
+        if not msg:
+            sel = action.selector or action.value or "unknown"
+            exc_name = type(exc).__name__
+            if "Timeout" in exc_name:
+                msg = f"Timed out after {action.timeout_ms}ms waiting for '{sel}'"
+            else:
+                msg = f"{exc_name}: element '{sel}' not found or not interactable"
+        return msg
 
     def _dispatch(self, action_type: ActionType):
         return {
@@ -188,6 +208,8 @@ class FlowExecutor:
 
     def _do_navigate(self, a: FlowAction) -> str:
         self._driver.get(a.value)
+        # Re-inject interceptor — navigation clears page JS state
+        self._inject_network_interceptor()
         return f"Navigated to {a.value}"
 
     def _do_scroll(self, a: FlowAction) -> str:
@@ -247,29 +269,46 @@ class FlowExecutor:
     def _do_assert_http_status(self, a: FlowAction) -> str:
         assert a.value is not None
         expected = int(a.value)
-        # Check captured network responses for matching status
         url_pattern = a.params.get("url_pattern", "")
+
+        # Harvest responses captured by our JS interceptor
+        harvested = self._harvest_responses()
+        self._captured_responses.extend(harvested)
+
+        # Check all captured responses (manually recorded + intercepted)
+        all_statuses = []
         for resp in self._captured_responses:
             url = resp.get("url", "")
             status = resp.get("status", 0)
+            all_statuses.append(f"{url} -> {status}")
             if url_pattern and url_pattern not in url:
                 continue
             if status == expected:
-                return f"HTTP {expected} assertion passed"
-        # Fallback: use JS performance entries
-        entries = self._driver.execute_script(
-            "return performance.getEntriesByType('resource')"
-            ".concat(performance.getEntriesByType('navigation'))"
-            ".map(e => ({name: e.name, status: e.responseStatus || 0}))"
-        )
-        for entry in entries:
-            if url_pattern and url_pattern not in entry.get("name", ""):
-                continue
-            if entry.get("status") == expected:
-                return f"HTTP {expected} assertion passed"
+                return f"HTTP {expected} assertion passed (url: {url})"
+
+        # Fallback: JS performance entries
+        try:
+            entries = self._driver.execute_script(
+                "return performance.getEntriesByType('resource')"
+                ".concat(performance.getEntriesByType('navigation'))"
+                ".map(e => ({name: e.name, status: e.responseStatus || 0}))"
+            )
+            for entry in entries:
+                name = entry.get("name", "")
+                status = entry.get("status", 0)
+                all_statuses.append(f"{name} -> {status}")
+                if url_pattern and url_pattern not in name:
+                    continue
+                if status == expected:
+                    return f"HTTP {expected} assertion passed (url: {name})"
+        except WebDriverException:
+            pass
+
+        detail = "; ".join(all_statuses[-10:]) if all_statuses else "none captured"
         raise AssertionError(
-            f"No response with status {expected} found"
-            + (f" matching '{url_pattern}'" if url_pattern else "")
+            f"Expected HTTP {expected} but not found. "
+            f"Captured responses: [{detail}]"
+            + (f" (filter: '{url_pattern}')" if url_pattern else "")
         )
 
     def _do_assert_banner(self, a: FlowAction) -> str:
@@ -305,6 +344,57 @@ class FlowExecutor:
             a.other_action_type, a.value, a.params,
         )
         return f"Other action '{a.other_action_type}' noted (no-op execution)"
+
+    # ---- network interception ---------------------------------------
+
+    _INTERCEPTOR_JS = """
+    if (!window.__symphonyResponses) {
+        window.__symphonyResponses = [];
+        // Intercept fetch()
+        const origFetch = window.fetch;
+        window.fetch = async function(...args) {
+            const resp = await origFetch.apply(this, args);
+            const url = (typeof args[0] === 'string') ? args[0]
+                      : (args[0] && args[0].url) ? args[0].url : '';
+            window.__symphonyResponses.push({url: url, status: resp.status});
+            return resp;
+        };
+        // Intercept XMLHttpRequest
+        const origOpen = XMLHttpRequest.prototype.open;
+        const origSend = XMLHttpRequest.prototype.send;
+        XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+            this.__symUrl = url;
+            return origOpen.apply(this, [method, url, ...rest]);
+        };
+        XMLHttpRequest.prototype.send = function(...args) {
+            this.addEventListener('load', function() {
+                window.__symphonyResponses.push({
+                    url: this.__symUrl || '', status: this.status
+                });
+            });
+            return origSend.apply(this, args);
+        };
+    }
+    """
+
+    def _inject_network_interceptor(self) -> None:
+        """Inject JS that records fetch/XHR response status codes."""
+        try:
+            self._driver.execute_script(self._INTERCEPTOR_JS)
+        except WebDriverException:
+            pass
+
+    def _harvest_responses(self) -> list[dict[str, Any]]:
+        """Pull captured responses from the injected interceptor."""
+        try:
+            responses = self._driver.execute_script(
+                "var r = window.__symphonyResponses || [];"
+                "window.__symphonyResponses = [];"
+                "return r;"
+            )
+            return responses if isinstance(responses, list) else []
+        except WebDriverException:
+            return []
 
     # ---- helpers ---------------------------------------------------
 

@@ -1,23 +1,36 @@
-"""Prompt Compiler — assembles context-aware prompts within token budgets."""
+"""Prompt Compiler — assembles context-aware prompts with optional token budgets."""
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, List, Optional
 
 logger = logging.getLogger(__name__)
 
 
 # ------------------------------------------------------------------
-# Token estimator (tiktoken-based when available, char fallback)
+# Token estimator (tiktoken-based when available, chars/4 fallback)
 # ------------------------------------------------------------------
 
-def estimate_tokens(text: str) -> int:
-    """Estimate token count. Uses tiktoken if available, else chars/4."""
+def estimate_tokens(text: str, model: Optional[str] = None) -> int:
+    """Estimate token count using tiktoken if available, else chars/4.
+
+    When *model* is provided, ``encoding_for_model`` resolves the exact
+    encoding (e.g. o200k_base for gpt-4o-class models, cl100k_base for
+    older ones). Without a model name, o200k_base is used — the encoding
+    for all current-generation OpenAI models and a reasonable approximation
+    for Gemini, which tokenises at a similar rate (~4 chars/token).
+    """
     try:
         import tiktoken
-        enc = tiktoken.encoding_for_model("gpt-4")
+        if model:
+            try:
+                enc = tiktoken.encoding_for_model(model)
+            except KeyError:
+                enc = tiktoken.get_encoding("o200k_base")
+        else:
+            enc = tiktoken.get_encoding("o200k_base")
         return len(enc.encode(text))
     except Exception:
         return len(text) // 4
@@ -33,7 +46,7 @@ class ContextBlock:
 
     name: str
     content: str
-    priority: int = 0  # higher = more important, kept first
+    priority: int = 0  # higher = more important, kept first when budgeting
     token_count: int = 0
 
     def __post_init__(self):
@@ -65,64 +78,82 @@ Rules:
 
 @dataclass
 class PromptCompiler:
-    """Assembles prompts from system prompt + dynamic context blocks,
-    respecting a token budget with priority-based truncation."""
+    """Assembles prompts from system prompt + dynamic context blocks.
 
-    token_budget: int = 16_000
+    When *token_budget* is None (default), all blocks are included
+    without truncation. Pass an integer to enable budget enforcement
+    with priority-based truncation.
+
+    Pass *model* to use the correct tiktoken encoding for the target
+    model when estimating token counts (e.g. "gpt-4o-mini"). Omit it
+    to use the o200k_base default, which is accurate for all current
+    OpenAI models and a close approximation for Gemini.
+
+    For accurate Gemini token counts before a request, use
+    ``LLMClient.count_tokens()`` — it calls the native
+    ``client.models.count_tokens`` endpoint rather than estimating locally.
+    """
+
+    token_budget: Optional[int] = None
     system_prompt: str = SYSTEM_PROMPT
+    model: Optional[str] = None
     _system_tokens: int = field(init=False, default=0)
 
     def __post_init__(self):
-        self._system_tokens = estimate_tokens(self.system_prompt)
+        self._system_tokens = estimate_tokens(self.system_prompt, self.model)
 
     @property
-    def available_budget(self) -> int:
+    def available_budget(self) -> Optional[int]:
+        if self.token_budget is None:
+            return None
         return self.token_budget - self._system_tokens
 
     def compile(
         self,
         goal: str,
-        blocks: list[ContextBlock],
+        blocks: List[ContextBlock],
         *,
         user_instruction: str = "",
-    ) -> list[dict[str, str]]:
-        """Return a messages list (system + user) fitting within budget.
+    ) -> List[dict]:
+        """Return a messages list (system + user).
 
-        Blocks are sorted by priority (desc) and included until the budget
-        is exhausted. Lower-priority blocks are truncated or dropped.
+        If *token_budget* is set, blocks are sorted by priority (desc)
+        and included until the budget is exhausted. Otherwise all
+        blocks are included in priority order.
         """
         sorted_blocks = sorted(blocks, key=lambda b: b.priority, reverse=True)
 
-        remaining = self.available_budget
         goal_section = f"## Goal\n{goal}\n"
-        remaining -= estimate_tokens(goal_section)
-
-        included_sections: list[str] = [goal_section]
+        included_sections: List[str] = [goal_section]
 
         if user_instruction:
-            instr_section = f"## Instructions\n{user_instruction}\n"
-            instr_tokens = estimate_tokens(instr_section)
-            if instr_tokens <= remaining:
-                included_sections.append(instr_section)
-                remaining -= instr_tokens
+            included_sections.append(f"## Instructions\n{user_instruction}\n")
 
-        for block in sorted_blocks:
-            if remaining <= 0:
-                break
-            if block.token_count <= remaining:
-                section = f"## {block.name}\n{block.content}\n"
-                included_sections.append(section)
-                remaining -= block.token_count
-            else:
-                # Truncate block to fit
-                chars_available = remaining * 4  # rough chars estimate
-                truncated = block.content[:chars_available]
-                section = f"## {block.name} (truncated)\n{truncated}\n"
-                included_sections.append(section)
-                remaining = 0
+        if self.token_budget is None:
+            for block in sorted_blocks:
+                included_sections.append(f"## {block.name}\n{block.content}\n")
+        else:
+            remaining = self.available_budget or 0
+            remaining -= estimate_tokens(goal_section, self.model)
+            if user_instruction:
+                remaining -= estimate_tokens(included_sections[-1], self.model)
+
+            for block in sorted_blocks:
+                if remaining <= 0:
+                    break
+                if block.token_count <= remaining:
+                    section = f"## {block.name}\n{block.content}\n"
+                    included_sections.append(section)
+                    remaining -= block.token_count
+                else:
+                    chars_available = remaining * 4
+                    truncated = block.content[:chars_available]
+                    included_sections.append(
+                        f"## {block.name} (truncated)\n{truncated}\n"
+                    )
+                    remaining = 0
 
         user_content = "\n".join(included_sections)
-
         return [
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": user_content},
@@ -131,14 +162,14 @@ class PromptCompiler:
     def compile_with_usage(
         self,
         goal: str,
-        blocks: list[ContextBlock],
+        blocks: List[ContextBlock],
         **kwargs: Any,
-    ) -> tuple[list[dict[str, str]], dict[str, int]]:
+    ) -> tuple:
         """Compile and return (messages, usage_info)."""
         messages = self.compile(goal, blocks, **kwargs)
-        total = sum(estimate_tokens(m["content"]) for m in messages)
-        return messages, {
-            "total_tokens": total,
-            "budget": self.token_budget,
-            "remaining": self.token_budget - total,
-        }
+        total = sum(estimate_tokens(m["content"], self.model) for m in messages)
+        usage: dict = {"total_tokens": total}
+        if self.token_budget is not None:
+            usage["budget"] = self.token_budget
+            usage["remaining"] = self.token_budget - total
+        return messages, usage

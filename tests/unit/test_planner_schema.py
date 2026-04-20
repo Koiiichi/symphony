@@ -173,11 +173,14 @@ class TestTaskGraph:
 # Heuristic fallback
 # ------------------------------------------------------------------
 
-class TestHeuristicFallback:
-    def test_produces_valid_graph(self):
-        from symphony.planner.planner import _heuristic_plan
-        graph = _heuristic_plan("fix contact form")
-        assert graph.goal == "fix contact form"
-        assert len(graph.nodes) >= 3
-        # Should be valid — no exception
-        graph.topo_order()
+class TestPlannerRequiresLLM:
+    def test_planner_raises_without_llm(self):
+        from unittest.mock import MagicMock
+        import pytest
+        from symphony.planner.planner import LLMPlanner
+
+        mock_client = MagicMock()
+        mock_client.complete.side_effect = RuntimeError("no key")
+        planner = LLMPlanner(mock_client)
+        with pytest.raises(RuntimeError):
+            planner.plan("fix contact form")

@@ -94,7 +94,14 @@ class TestPromptCompiler:
         )
         assert "Be concise" in messages[1]["content"]
 
-    def test_compile_with_usage(self):
+    def test_compile_with_usage_no_budget(self):
+        compiler = PromptCompiler()
+        messages, usage = compiler.compile_with_usage("goal", [])
+        assert "total_tokens" in usage
+        assert "budget" not in usage
+        assert "remaining" not in usage
+
+    def test_compile_with_usage_with_budget(self):
         compiler = PromptCompiler(token_budget=16_000)
         messages, usage = compiler.compile_with_usage("goal", [])
         assert "total_tokens" in usage
@@ -103,9 +110,13 @@ class TestPromptCompiler:
         assert usage["budget"] == 16_000
         assert usage["remaining"] > 0
 
-    def test_available_budget(self):
+    def test_available_budget_no_limit(self):
+        compiler = PromptCompiler()
+        assert compiler.available_budget is None
+
+    def test_available_budget_with_limit(self):
         compiler = PromptCompiler(token_budget=16_000)
-        assert compiler.available_budget < 16_000  # system prompt takes some
+        assert compiler.available_budget < 16_000
         assert compiler.available_budget > 0
 
     def test_custom_system_prompt(self):

@@ -5,7 +5,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class ActionType(str, Enum):
@@ -24,14 +24,45 @@ class ActionType(str, Enum):
 class FlowAction(BaseModel):
     """A single browser action in the Flow DSL."""
 
-    action: ActionType
-    selector: Optional[str] = None
-    value: Optional[str] = None
-    timeout_ms: int = Field(default=10_000, ge=0)
-    params: Dict[str, Any] = Field(default_factory=dict)
+    model_config = ConfigDict(json_schema_extra={})
 
-    # For OTHER action type — caller describes what this does
-    other_action_type: Optional[str] = None
+    action: ActionType = Field(
+        description=(
+            "The action to perform. One of: navigate, scroll, click, fill, press, "
+            "wait_for, assert_text, assert_http_status, assert_banner, other."
+        )
+    )
+    selector: Optional[str] = Field(
+        default=None,
+        description=(
+            "CSS selector identifying the target element. "
+            "Required for: click, fill, wait_for, assert_text."
+        ),
+    )
+    value: Optional[str] = Field(
+        default=None,
+        description=(
+            "String value for the action. "
+            "navigate: the URL to load. "
+            "fill: text to type into the element. "
+            "press: key name (e.g. 'Enter', 'Tab'). "
+            "assert_text: expected text that must appear in the element (must be non-empty). "
+            "assert_http_status: expected HTTP status code as a string (e.g. '401'). "
+            "assert_banner: expected banner text (must be non-empty)."
+        ),
+    )
+    timeout_ms: int = Field(
+        default=10_000, ge=0,
+        description="Milliseconds to wait before timing out this action.",
+    )
+    params: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Extra provider-specific parameters, if any.",
+    )
+    other_action_type: Optional[str] = Field(
+        default=None,
+        description="Required when action is 'other'. Describes the custom action type.",
+    )
 
     @model_validator(mode="after")
     def _validate_required_fields(self) -> "FlowAction":
@@ -77,9 +108,14 @@ class FlowAction(BaseModel):
 class FlowScript(BaseModel):
     """An ordered sequence of FlowActions constituting a browser test flow."""
 
-    name: str
-    description: str = ""
-    actions: List[FlowAction] = Field(min_length=1)
+    model_config = ConfigDict(json_schema_extra={})
+
+    name: str = Field(description="Unique name for this flow script.")
+    description: str = Field(default="", description="What this flow tests.")
+    actions: List[FlowAction] = Field(
+        min_length=1,
+        description="Ordered list of actions to execute.",
+    )
 
     def assertion_actions(self) -> List[FlowAction]:
         """Return only the assertion-type actions."""

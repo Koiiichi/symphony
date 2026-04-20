@@ -4,15 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import Optional, Tuple
 
 from symphony.planner.schema import (
-    AcceptanceCriterion,
-    NodeType,
-    TaskEdge,
     TaskGraph,
-    TaskNode,
-    RetryPolicy,
 )
 from symphony.prompt.compiler import ContextBlock, PromptCompiler
 
@@ -40,8 +35,8 @@ TaskGraph JSON schema:
       "config": {},
       "retry": {"max_attempts": 3, "backoff_seconds": 1.0},
       "preconditions": ["<description>", ...],
-      "actions": [<FlowAction objects for web_flow_test nodes>],
-      "assertions": [<assertion objects for web_flow_test nodes>],
+      "actions": [<FlowAction objects for web_flow_test nodes — see FlowAction schema below>],
+      "assertions": [<assertion FlowAction objects for web_flow_test nodes — see FlowAction schema below>],
       "evidence_requirements": {"screenshot": true, "network_trace": false, "dom_snapshot": false, "focused_element_trace": false},
       "other_task_type": "<required if type is 'other'>"
     }
@@ -49,6 +44,18 @@ TaskGraph JSON schema:
   "edges": [{"source": "<node_id>", "target": "<node_id>", "condition": "<optional>"}],
   "acceptance_criteria": [{"id": "<id>", "description": "<text>", "required": true}]
 }
+
+FlowAction schema (use for actions and assertions arrays):
+{
+  "action": "<navigate|scroll|click|fill|press|wait_for|assert_text|assert_http_status|assert_banner|other>",
+  "selector": "<CSS selector — required for click, fill, wait_for, assert_text>",
+  "value": "<string — required for navigate (URL), fill (text), press (key), assert_text (expected text), assert_http_status (status code as string), assert_banner (expected text)>",
+  "timeout_ms": 10000,
+  "params": {},
+  "other_action_type": "<required only when action is 'other'>"
+}
+
+IMPORTANT: Use "action" (not "type") as the field name for the action type.
 
 Node type guide:
 - stack_detect: identify project stack/framework
@@ -66,62 +73,8 @@ Rules:
 - Every web_flow_test MUST have actions and assertions.
 - Use edges to express dependencies between nodes.
 - Prefer smaller, focused nodes over large monolithic ones.
+- Use the exact CSS selectors from the provided HTML context (ids, names, classes). Do NOT guess selectors.
 """
-
-
-# ------------------------------------------------------------------
-# Heuristic fallback planner
-# ------------------------------------------------------------------
-
-def _heuristic_plan(goal: str, project_path: str | None = None) -> TaskGraph:
-    """Minimal fallback plan when LLM planner fails."""
-    nodes = [
-        TaskNode(
-            id="detect",
-            type=NodeType.STACK_DETECT,
-            description="Detect project stack and framework",
-        ),
-        TaskNode(
-            id="start",
-            type=NodeType.SERVICE_START,
-            description="Start application services",
-        ),
-        TaskNode(
-            id="discover",
-            type=NodeType.UI_DISCOVERY,
-            description="Discover UI structure and available pages",
-        ),
-        TaskNode(
-            id="test",
-            type=NodeType.WEB_FLOW_TEST,
-            description=f"Test web flow for: {goal}",
-            actions=[{"action": "navigate", "value": "http://localhost:3000"}],
-            assertions=[{"action": "assert_text", "selector": "body", "value": ""}],
-            evidence_requirements={"screenshot": True},
-        ),
-        TaskNode(
-            id="finalize",
-            type=NodeType.FINALIZE,
-            description="Generate report",
-        ),
-    ]
-    edges = [
-        TaskEdge(source="detect", target="start"),
-        TaskEdge(source="start", target="discover"),
-        TaskEdge(source="discover", target="test"),
-        TaskEdge(source="test", target="finalize"),
-    ]
-    return TaskGraph(
-        goal=goal,
-        nodes=nodes,
-        edges=edges,
-        acceptance_criteria=[
-            AcceptanceCriterion(
-                id="goal_met",
-                description=f"Goal achieved: {goal}",
-            )
-        ],
-    )
 
 
 # ------------------------------------------------------------------
@@ -129,17 +82,15 @@ def _heuristic_plan(goal: str, project_path: str | None = None) -> TaskGraph:
 # ------------------------------------------------------------------
 
 class LLMPlanner:
-    """Plans task graphs using an LLM, with heuristic fallback."""
+    """Plans task graphs using an LLM."""
 
     def __init__(
         self,
-        llm_client: Any,
+        llm_client: "LLMClient",  # noqa: F821 — avoids circular import
         *,
-        model: str = "claude-sonnet-4-20250514",
-        token_budget: int = 8_000,
+        token_budget: Optional[int] = None,
     ):
         self._client = llm_client
-        self._model = model
         self._compiler = PromptCompiler(
             token_budget=token_budget, system_prompt=PLANNER_SYSTEM
         )
@@ -150,14 +101,17 @@ class LLMPlanner:
         *,
         project_context: str = "",
         prior_failures: str = "",
-        project_path: str | None = None,
-    ) -> tuple[TaskGraph, float | None]:
+        project_path: Optional[str] = None,
+    ) -> Tuple[TaskGraph, Optional[float], int]:
         """Generate a TaskGraph for *goal*.
 
-        Returns (graph, confidence) where confidence is the model's
-        self-reported confidence (0-1) or None.
+        Returns (graph, confidence, token_estimate) where confidence is
+        the model's self-reported confidence (0-1) or None, and
+        token_estimate is the estimated prompt tokens used.
+
+        Raises on LLM or parsing failure — no silent fallback.
         """
-        blocks: list[ContextBlock] = []
+        blocks: list = []
         if project_context:
             blocks.append(ContextBlock(
                 name="Project Context", content=project_context, priority=10
@@ -167,32 +121,21 @@ class LLMPlanner:
                 name="Prior Failures", content=prior_failures, priority=20
             ))
 
-        messages = self._compiler.compile(goal, blocks)
+        messages, usage = self._compiler.compile_with_usage(goal, blocks)
+        prompt_tokens = usage.get("total_tokens", 0)
+        system = messages[0]["content"] if messages and messages[0]["role"] == "system" else ""
+        user_messages = [m for m in messages if m["role"] != "system"]
 
-        try:
-            response = self._client.messages.create(
-                model=self._model,
-                max_tokens=4096,
-                messages=[m for m in messages if m["role"] != "system"],
-                system=messages[0]["content"] if messages[0]["role"] == "system" else "",
-            )
-            raw = response.content[0].text.strip()
-            # Strip markdown fences if present
-            if raw.startswith("```"):
-                raw = raw.split("\n", 1)[1]
-                if raw.endswith("```"):
-                    raw = raw[:-3]
-            data = json.loads(raw)
-            graph = TaskGraph.model_validate(data)
-            confidence = data.get("confidence")
-            logger.info("LLM planner produced graph with %d nodes", len(graph.nodes))
-            return graph, confidence
-        except Exception as exc:
-            logger.warning("LLM planner failed (%s), using heuristic fallback", exc)
-            return _heuristic_plan(goal, project_path), None
-
-    def plan_heuristic(
-        self, goal: str, *, project_path: str | None = None
-    ) -> TaskGraph:
-        """Direct access to the heuristic fallback planner."""
-        return _heuristic_plan(goal, project_path)
+        raw = self._client.complete(
+            user_messages, system=system, response_schema=TaskGraph
+        ).strip()
+        # Strip markdown fences if present (fallback for providers that ignore schema)
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[1]
+            if raw.endswith("```"):
+                raw = raw[:-3]
+        data = json.loads(raw)
+        graph = TaskGraph.model_validate(data)
+        confidence = data.get("confidence")
+        logger.info("LLM planner produced graph with %d nodes", len(graph.nodes))
+        return graph, confidence, prompt_tokens

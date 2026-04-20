@@ -16,7 +16,7 @@ from symphony.planner.schema import (
     TaskGraph,
     TaskNode,
 )
-from symphony.planner.planner import LLMPlanner, _heuristic_plan
+from symphony.planner.planner import LLMPlanner
 from symphony.flow.dsl import ActionType, FlowAction, FlowScript
 from symphony.flow.executor import ActionResult, Evidence, FlowExecutor, FlowResult
 from symphony.evaluator.evaluator import ReliabilityEvaluator, Severity
@@ -295,7 +295,8 @@ class TestTokenBudgetRegression:
     ]
 
     def test_prompts_fit_budget(self):
-        compiler = PromptCompiler(token_budget=16_000)
+        budget = 16_000
+        compiler = PromptCompiler(token_budget=budget)
         for goal in self.GOALS:
             blocks = [
                 ContextBlock(name="Failures", content="Error: assert failed\n" * 50, priority=20),
@@ -303,31 +304,33 @@ class TestTokenBudgetRegression:
                 ContextBlock(name="DOM Snapshot", content="<html>" + "<div>" * 500 + "</html>", priority=5),
             ]
             messages, usage = compiler.compile_with_usage(goal, blocks)
-            assert usage["total_tokens"] <= 16_000, (
+            assert usage["total_tokens"] <= budget, (
                 f"Budget exceeded for goal: {goal} (used {usage['total_tokens']})"
             )
-            assert usage["remaining"] >= 0
+            assert usage["budget"] == budget
+
+    def test_no_budget_includes_all_blocks(self):
+        compiler = PromptCompiler()  # no budget
+        blocks = [
+            ContextBlock(name="Block A", content="content A", priority=5),
+            ContextBlock(name="Block B", content="content B", priority=1),
+        ]
+        messages, usage = compiler.compile_with_usage("goal", blocks)
+        user_content = messages[1]["content"]
+        assert "Block A" in user_content
+        assert "Block B" in user_content
+        assert "budget" not in usage
 
 
 # ------------------------------------------------------------------
-# Planner heuristic fallback
+# Planner error handling
 # ------------------------------------------------------------------
 
-class TestPlannerFallback:
-    def test_heuristic_produces_valid_graph(self):
-        graph = _heuristic_plan("fix broken form")
-        assert isinstance(graph, TaskGraph)
-        assert graph.goal == "fix broken form"
-        order = graph.topo_order()
-        assert len(order) == len(graph.nodes)
-
-    def test_llm_planner_falls_back_on_error(self):
+class TestPlannerErrors:
+    def test_llm_planner_raises_on_error(self):
         mock_client = MagicMock()
-        mock_client.messages.create.side_effect = RuntimeError("API down")
+        mock_client.complete.side_effect = RuntimeError("API down")
 
         planner = LLMPlanner(mock_client)
-        graph, confidence = planner.plan("test goal")
-
-        assert isinstance(graph, TaskGraph)
-        assert confidence is None  # fallback has no confidence
-        assert graph.goal == "test goal"
+        with pytest.raises(RuntimeError, match="API down"):
+            planner.plan("test goal")
