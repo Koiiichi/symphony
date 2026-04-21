@@ -19,7 +19,7 @@ from symphony.planner.schema import (
 from symphony.planner.planner import LLMPlanner
 from symphony.flow.dsl import ActionType, FlowAction, FlowScript
 from symphony.flow.executor import ActionResult, Evidence, FlowExecutor, FlowResult
-from symphony.evaluator.evaluator import ReliabilityEvaluator, Severity
+from symphony.evaluator.evaluator import ReliabilityEvaluator, RunStatus, Severity
 from symphony.prompt.compiler import ContextBlock, PromptCompiler
 
 
@@ -81,7 +81,7 @@ class TestContactFormHappyPath:
         evaluator = ReliabilityEvaluator()
         report = evaluator.evaluate([flow_result])
         assert report.passed
-        assert report.status == "pass"
+        assert report.status is RunStatus.PASS
 
 
 # ------------------------------------------------------------------

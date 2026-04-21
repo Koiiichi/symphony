@@ -14,13 +14,13 @@ It replaces brittle keyword heuristics and hardcoded interaction patterns with a
 
 ## How it works
 
-**Plan.** You provide a goal in plain language. An LLM reads minimal project context — your dependency manifest, top-level file listing — and emits a typed `TaskGraph`: an ordered sequence of nodes connected by explicit dependency edges. If the LLM call fails or returns invalid output, a minimal heuristic graph (detect → start → test → finalize) is used instead.
+**Plan.** You provide a goal in plain language. An LLM reads your project context (dependency manifest, top-level file listing, and HTML pages) and emits a typed `TaskGraph`: an ordered sequence of nodes connected by explicit dependency edges. The HTML context lets the LLM use exact selectors (`#email`, `input[name="password"]`) rather than guessing. Structured output enforcement (via Gemini `response_json_schema` or OpenAI `response_format`) ensures the response is always a valid, schema-conforming TaskGraph with no parsing fallbacks. If planning fails, the error is surfaced immediately.
 
-**Execute.** Nodes run in topological order. Stack detection scans for language and framework markers. Service startup launches your backend and frontend as subprocesses. Browser flow nodes drive a real Chrome instance using a validated Flow DSL — the LLM cannot run arbitrary scripts, only emit structured actions that are validated before execution. API check nodes hit endpoints directly. Code patch nodes apply search-replace diffs to your source files. Screenshots are captured at every step.
+**Execute.** Nodes run in topological order. Stack detection scans for language and framework markers. Service startup launches your backend and frontend as subprocesses. Browser flow nodes drive a real Chrome instance using a validated Flow DSL; the LLM cannot run arbitrary scripts, only emit structured actions that are validated before execution. A JavaScript network interceptor captures `fetch`/`XHR` response statuses so `assert_http_status` works against real API calls, not just navigations. API check nodes hit endpoints directly with full request body and header support. Code patch nodes apply search-replace diffs to your source files. Screenshots are captured at every step.
 
 **Evaluate.** A Reliability Evaluator checks every flow assertion, HTTP expectation, and accessibility requirement. It produces a machine-readable report with typed failure reasons and artifact pointers. Exit code is `0` on pass, `1` on failure.
 
-**Patch.** If `--passes` is greater than 1 and the run failed, Symphony feeds the failure evidence back to the LLM, which proposes a targeted source patch. The graph reruns. This repeats until the application passes or the pass limit is reached.
+**Patch.** If `--passes` is greater than 1 and the run failed, Symphony feeds the failure evidence back to the LLM, which proposes a targeted source patch. The graph reruns, repeating until the application passes or the pass limit is reached.
 
 ## Comparison
 
@@ -106,8 +106,10 @@ symphony replay --run-id run_20260419_150159
 | `--passes` | Number of fix-retest cycles (default: 1) |
 | `--provider` | `openai` or `gemini` (auto-detected if unset) |
 | `--model` | Model name (defaults to provider default) |
-| `--token-budget` | Max prompt tokens — unlimited by default |
-| `--artifact-dir` | Directory for screenshots, traces, and reports |
+| `--token-budget` | Max prompt tokens (unlimited by default) |
+| `--artifact-dir` | Override artifact output directory |
+| `--edit-mode` | Patch behavior: `ask` (default), `suggest`, `auto` |
+| `--write-scope` | Restrict editable paths (repeatable) |
 
 ## Provider defaults
 
@@ -120,17 +122,21 @@ Pass `--model` to override.
 
 ## Output
 
-Every run writes to the artifact directory:
+The terminal shows live progress as each node executes: plan generation, node-by-node status, and pass/fail inline, then prints the full report on completion.
+
+Every run also writes artifacts to the **target project** directory:
 
 ```
-artifacts/run_<timestamp>/
+<project>/artifacts/run_<timestamp>/
   taskgraph.json     TaskGraph the planner produced
   report.json        Machine-readable pass/fail report
   <node_id>/         Per-node screenshots and DOM snapshots
     step_001_navigate.png
-    step_002_click.png
+    step_002_fill.png
     ...
 ```
+
+Override the location with `--artifact-dir`.
 
 `report.json` schema:
 
@@ -138,13 +144,25 @@ artifacts/run_<timestamp>/
 {
   "status": "pass | fail",
   "failing_reasons": [
-    { "id": "...", "severity": "critical | warning", "message": "..." }
+    { "id": "...", "severity": "critical | warning", "message": "...", "node_id": "..." }
   ],
   "assertion_results": [
-    { "assertion_id": "...", "passed": true, "message": "..." }
+    { "assertion_id": "...", "passed": true, "message": "...", "node_id": "..." }
   ],
   "artifacts": [
     { "type": "screenshot", "path": "...", "node_id": "..." }
+  ],
+  "patches": [
+    {
+      "proposal_id": "...",
+      "mode": "ask | suggest | auto",
+      "decision": "applied | rejected | suggested | skipped",
+      "applied_files": ["..."],
+      "blocked_reason": "manual_approval_required | user_rejected | ...",
+      "proposal_path": "...",
+      "diff_path": "...",
+      "summary": { "files": 1, "added": 2, "removed": 1 }
+    }
   ],
   "token_usage": { "total": 1240 },
   "planner_confidence": 0.9
@@ -170,7 +188,7 @@ Symphony's browser actions are structured and validated before execution:
 | `assert_banner` | `value` (expected text) |
 | `other` | `other_action_type` (description) |
 
-The `other` action type accepts any task that doesn't fit the standard set. It is logged and treated as a no-op in the executor, keeping execution strictly deterministic.
+`assert_http_status` works by injecting a JavaScript interceptor that captures every `fetch` and `XHR` response during the flow, not just page navigations. The `other` action type is logged and skipped; it exists so the LLM can annotate intent without causing execution errors.
 
 ## TaskGraph node types
 
@@ -180,11 +198,11 @@ The `other` action type accepts any task that doesn't fit the standard set. It i
 | `service_start` | Start backend or frontend servers |
 | `ui_discovery` | Explore the UI before testing |
 | `web_flow_test` | Execute a browser flow with assertions |
-| `api_check` | Verify an API endpoint directly |
+| `api_check` | Verify an API endpoint directly (supports request body and headers) |
 | `code_patch` | Modify application source to fix a failure |
 | `retest` | Re-run a prior test node after a patch |
 | `finalize` | Cleanup and report generation |
-| `other` | Any task outside the standard types |
+| `other` | Intent annotation for tasks outside the standard types (logged, not executed) |
 
 ## Development
 
@@ -194,7 +212,7 @@ pip install -e ".[openai,budget,dev]"
 python -m pytest
 ```
 
-All tests run without a live browser or API key. Browser-dependent tests require Chrome and a valid API key.
+All tests run without a live browser or API key.
 
 ## License
 

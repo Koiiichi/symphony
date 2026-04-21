@@ -12,6 +12,7 @@ from symphony.evaluator.evaluator import (
     EvalReport,
     FailureReason,
     ReliabilityEvaluator,
+    RunStatus,
     Severity,
 )
 from symphony.flow.dsl import ActionType, FlowAction
@@ -55,7 +56,7 @@ class TestReliabilityEvaluator:
         )
         report = ev.evaluate([flow])
         assert report.passed
-        assert report.status == "pass"
+        assert report.status is RunStatus.PASS
         assert len(report.failing_reasons) == 0
 
     def test_assertion_failure(self):
@@ -69,7 +70,7 @@ class TestReliabilityEvaluator:
         )
         report = ev.evaluate([flow])
         assert not report.passed
-        assert report.status == "fail"
+        assert report.status is RunStatus.FAIL
         critical = [f for f in report.failing_reasons if f.severity == Severity.CRITICAL]
         assert len(critical) >= 1
 
@@ -130,6 +131,27 @@ class TestReliabilityEvaluator:
         report = ev.evaluate([flow], planner_confidence=0.85)
         assert report.planner_confidence == 0.85
 
+    def test_network_trace_artifact_is_reported(self):
+        ev = ReliabilityEvaluator()
+        flow = FlowResult(
+            script_name="trace_flow",
+            passed=True,
+            results=[ActionResult(
+                action=FlowAction(action=ActionType.NAVIGATE, value="http://localhost"),
+                success=True,
+                message="ok",
+            )],
+            evidence=Evidence(
+                screenshots=[Path("/tmp/test.png")],
+                network_traces=[{"path": "/tmp/network_trace.json", "entries": 2}],
+            ),
+        )
+        report = ev.evaluate([flow])
+        assert any(
+            a.type == "network_trace" and a.path == "/tmp/network_trace.json"
+            for a in report.artifacts
+        )
+
     def test_to_dict_roundtrip(self):
         ev = ReliabilityEvaluator()
         flow = _make_flow_result(
@@ -146,15 +168,15 @@ class TestReliabilityEvaluator:
 
 class TestEvalReport:
     def test_pass_report(self):
-        r = EvalReport(status="pass")
+        r = EvalReport(status=RunStatus.PASS)
         assert r.passed is True
 
     def test_fail_report(self):
-        r = EvalReport(status="fail")
+        r = EvalReport(status=RunStatus.FAIL)
         assert r.passed is False
 
     def test_empty_to_dict(self):
-        r = EvalReport(status="pass")
+        r = EvalReport(status=RunStatus.PASS)
         d = r.to_dict()
         assert d["status"] == "pass"
         assert d["failing_reasons"] == []

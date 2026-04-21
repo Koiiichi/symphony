@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sys
 from pathlib import Path
 from typing import Optional
@@ -13,6 +14,8 @@ from rich.panel import Panel
 from rich.text import Text
 
 from symphony import __version__
+from symphony.evaluator.evaluator import RunStatus
+from symphony.patching.policy import EditMode
 
 console = Console()
 
@@ -40,6 +43,21 @@ def cli():
               help="Max token budget for prompts. Unlimited by default.")
 @click.option("--artifact-dir", default=None, type=click.Path(),
               help="Directory for run artifacts.")
+@click.option(
+    "--edit-mode",
+    default=EditMode.ASK.value,
+    show_default=True,
+    type=click.Choice([e.value for e in EditMode], case_sensitive=False),
+    help="Patch editing mode: ask for approval, suggest only, or auto apply.",
+)
+@click.option(
+    "--write-scope",
+    multiple=True,
+    type=click.Path(exists=True),
+    help="Restrict editable paths. Can be passed multiple times.",
+)
+@click.option("--verbose", "-v", is_flag=True, default=False,
+              help="Show detailed log output (INFO level).")
 def run(
     project: str,
     goal: str,
@@ -49,8 +67,12 @@ def run(
     model: Optional[str],
     token_budget: Optional[int],
     artifact_dir: Optional[str],
+    edit_mode: str,
+    write_scope: tuple[str, ...],
+    verbose: bool,
 ):
     """Execute a Symphony reliability run."""
+    from rich.logging import RichHandler
     from symphony.llm import LLMClient
     from symphony.orchestrator import Orchestrator
 
@@ -60,6 +82,9 @@ def run(
         console.print(f"[red bold]Error:[/] {exc}")
         sys.exit(1)
 
+    # Print the header first so it's always the first thing the user sees,
+    # then configure logging — this prevents verbose log lines from the
+    # LLM client init appearing above the header.
     console.print(
         Panel(
             f"[bold]{goal}[/]\n"
@@ -70,17 +95,60 @@ def run(
         )
     )
 
+    level = logging.INFO if verbose else logging.WARNING
+    logging.basicConfig(
+        level=level,
+        format="%(name)s: %(message)s",
+        datefmt="[%X]",
+        handlers=[RichHandler(
+            console=console,
+            show_path=False,
+            rich_tracebacks=True,
+            markup=False,
+        )],
+    )
+
     project_path = Path(project).resolve()
     art_dir = Path(artifact_dir) if artifact_dir else None
+    scope_paths = [Path(p).resolve() for p in write_scope] if write_scope else [project_path]
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    requested_edit_mode = EditMode(edit_mode.lower())
+    effective_edit_mode = requested_edit_mode
+    require_manual_approval = False
+    if requested_edit_mode is EditMode.ASK and not interactive:
+        effective_edit_mode = EditMode.SUGGEST
+        require_manual_approval = True
+        console.print(
+            "[yellow]Non-interactive environment detected: "
+            "falling back from ask -> suggest mode.[/]"
+        )
+
+    status = console.status("", spinner="dots")
+
+    def request_patch_approval(payload: dict) -> bool:
+        status.stop()
+        summary = payload.get("summary", {})
+        console.print(
+            "[bold]Approve patch batch?[/] "
+            f"{payload.get('proposal_id', 'unknown')} "
+            f"(files={summary.get('files', 0)}, "
+            f"+{summary.get('added', 0)}/-{summary.get('removed', 0)})"
+        )
+        approved = click.confirm("Apply this patch batch", default=False)
+        status.start()
+        return approved
 
     orch = Orchestrator(
         project_path=project_path,
         llm=llm,
         token_budget=token_budget,
         artifact_dir=art_dir,
+        edit_mode=effective_edit_mode.value,
+        write_scope=scope_paths,
+        require_manual_approval=require_manual_approval,
+        request_patch_approval=request_patch_approval if effective_edit_mode is EditMode.ASK else None,
     )
 
-    status = console.status("", spinner="dots")
     status.start()
 
     def on_progress(event: str, detail: str) -> None:
@@ -96,10 +164,39 @@ def run(
             status.update(f"[cyan]{detail}[/]")
         elif event == "node_result":
             status.stop()
-            if "fail" in detail:
+            # Check for actual failure — detail format is "node_id: pass/fail (...)"
+            is_fail = ": fail" in detail or detail.startswith("fail")
+            if is_fail:
                 console.print(f"  [red]-[/] {detail}")
             else:
                 console.print(f"  [green]+[/] {detail}")
+            status.start()
+        elif event == "patch_proposed":
+            status.stop()
+            payload = _safe_json(detail)
+            _print_patch_preview(payload)
+            status.start()
+        elif event == "patch_decision":
+            status.stop()
+            payload = _safe_json(detail)
+            decision = payload.get("decision", "unknown")
+            reason = payload.get("blocked_reason")
+            suffix = f" ({reason})" if reason else ""
+            console.print(f"  [cyan]~[/] Patch decision: {decision}{suffix}")
+            status.start()
+        elif event == "patch_applied":
+            status.stop()
+            payload = _safe_json(detail)
+            diff_path = payload.get("diff_path")
+            if diff_path and Path(diff_path).exists():
+                console.print(f"  [green]+[/] Patch applied: {payload.get('proposal_id', 'unknown')}")
+                _print_colored_diff(Path(diff_path).read_text(errors="replace"))
+            status.start()
+        elif event == "patch_blocked":
+            status.stop()
+            payload = _safe_json(detail)
+            reason = payload.get("blocked_reason", "blocked")
+            console.print(f"  [yellow]![/] Patch blocked: {reason}")
             status.start()
         elif event == "done":
             status.stop()
@@ -116,7 +213,7 @@ def run(
 
     console.print()
     _print_report(report)
-    sys.exit(0 if report.get("status") == "pass" else 1)
+    sys.exit(0 if report.get("status") == RunStatus.PASS.value else 1)
 
 
 @cli.command()
@@ -182,7 +279,7 @@ def replay(run_id: str, artifact_dir: str):
 
 def _print_report(report: dict):
     status = report.get("status", "unknown")
-    if status == "pass":
+    if status == RunStatus.PASS.value:
         console.print("[bold green]PASS[/]", highlight=False)
     else:
         console.print("[bold red]FAIL[/]", highlight=False)
@@ -216,6 +313,54 @@ def _print_report(report: dict):
     if usage:
         total = usage.get("total", 0)
         console.print(f"\n[dim]Tokens used: {total}[/]")
+
+
+def _safe_json(raw: str) -> dict:
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+
+def _print_patch_preview(payload: dict) -> None:
+    summary = payload.get("summary", {})
+    console.print(
+        "  [cyan]~[/] Patch proposed: "
+        f"{summary.get('files', 0)} file(s), "
+        f"+{summary.get('added', 0)}/-{summary.get('removed', 0)} "
+        f"[dim]({payload.get('proposal_id', 'unknown')})[/]"
+    )
+    for file_info in payload.get("files", []):
+        console.print(
+            f"      [bold]{file_info.get('file', '?')}[/] "
+            f"(+{file_info.get('added', 0)}/-{file_info.get('removed', 0)})"
+        )
+        for line in file_info.get("preview", []):
+            styled = Text(f"      {line}")
+            if line.startswith("+") and not line.startswith("+++"):
+                styled.stylize("green")
+            elif line.startswith("-") and not line.startswith("---"):
+                styled.stylize("red")
+            elif line.startswith("@@"):
+                styled.stylize("cyan")
+            console.print(styled)
+
+
+def _print_colored_diff(diff_text: str) -> None:
+    if not diff_text.strip():
+        return
+    console.print("\n[bold]Applied Diff[/]")
+    for line in diff_text.splitlines():
+        styled = Text(line)
+        if line.startswith("+") and not line.startswith("+++"):
+            styled.stylize("green")
+        elif line.startswith("-") and not line.startswith("---"):
+            styled.stylize("red")
+        elif line.startswith("@@"):
+            styled.stylize("cyan")
+        elif line.startswith(("---", "+++")):
+            styled.stylize("bold")
+        console.print(styled)
 
 
 if __name__ == "__main__":

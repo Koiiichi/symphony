@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 import logging
 from dataclasses import dataclass, field
@@ -121,6 +122,7 @@ class FlowExecutor:
 
             # aggregate evidence
             combined_evidence.screenshots.extend(result.evidence.screenshots)
+            combined_evidence.network_traces.extend(result.evidence.network_traces)
             combined_evidence.dom_snapshots.extend(result.evidence.dom_snapshots)
             combined_evidence.focused_elements.extend(
                 result.evidence.focused_elements
@@ -135,6 +137,21 @@ class FlowExecutor:
                     ActionType.ASSERT_BANNER,
                 }:
                     break
+
+        if self._collect_network:
+            harvested = self._harvest_responses()
+            if harvested:
+                self._captured_responses.extend(harvested)
+            network_path = self._artifact_dir / "network_trace.json"
+            try:
+                network_path.write_text(
+                    json.dumps(self._captured_responses, indent=2, ensure_ascii=True)
+                )
+                combined_evidence.network_traces.append(
+                    {"path": str(network_path), "entries": len(self._captured_responses)}
+                )
+            except OSError as exc:
+                logger.warning("Could not save network trace at %s: %s", network_path, exc)
 
         return FlowResult(
             script_name=script.name,
@@ -207,6 +224,10 @@ class FlowExecutor:
     # ---- action handlers -------------------------------------------
 
     def _do_navigate(self, a: FlowAction) -> str:
+        if self._collect_network:
+            harvested = self._harvest_responses()
+            if harvested:
+                self._captured_responses.extend(harvested)
         self._driver.get(a.value)
         # Re-inject interceptor — navigation clears page JS state
         self._inject_network_interceptor()

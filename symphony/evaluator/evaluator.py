@@ -14,6 +14,11 @@ from symphony.flow.executor import FlowResult
 # Report types
 # ------------------------------------------------------------------
 
+class RunStatus(str, Enum):
+    PASS = "pass"
+    FAIL = "fail"
+
+
 class Severity(str, Enum):
     CRITICAL = "critical"
     WARNING = "warning"
@@ -48,7 +53,7 @@ class Artifact:
 class EvalReport:
     """Machine-readable evaluation report."""
 
-    status: str  # "pass" or "fail"
+    status: RunStatus
     failing_reasons: list[FailureReason] = field(default_factory=list)
     assertion_results: list[AssertionResult] = field(default_factory=list)
     artifacts: list[Artifact] = field(default_factory=list)
@@ -57,11 +62,11 @@ class EvalReport:
 
     @property
     def passed(self) -> bool:
-        return self.status == "pass"
+        return self.status is RunStatus.PASS
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "status": self.status,
+            "status": self.status.value,
             "failing_reasons": [
                 {"id": f.id, "severity": f.severity.value,
                  "message": f.message, "node_id": f.node_id,
@@ -125,6 +130,17 @@ class ReliabilityEvaluator:
                 artifacts.append(Artifact(
                     type="dom_snapshot", path=dom[:100], node_id=fr.script_name
                 ))
+            for trace in fr.evidence.network_traces:
+                if isinstance(trace, dict):
+                    trace_path = trace.get("path")
+                    if trace_path:
+                        artifacts.append(Artifact(
+                            type="network_trace", path=str(trace_path), node_id=fr.script_name
+                        ))
+                elif trace:
+                    artifacts.append(Artifact(
+                        type="network_trace", path=str(trace), node_id=fr.script_name
+                    ))
 
             for ar in fr.results:
                 a_id = f"{fr.script_name}:{ar.action.action.value}:{ar.action.selector or 'global'}"
@@ -195,11 +211,23 @@ class ReliabilityEvaluator:
                     node_id=fr.script_name,
                 ))
 
+        # ---- Guard against vacuous passes ----
+        # If no assertions ran at all, the run produced no signal — treat as fail.
+        if not assertion_results:
+            failures.append(FailureReason(
+                id="no_assertions_run",
+                severity=Severity.CRITICAL,
+                message=(
+                    "No assertions were executed. The task graph contained no "
+                    "web_flow_test or api_check nodes with verifiable actions."
+                ),
+            ))
+
         # ---- Determine overall status ----
         critical_failures = [
             f for f in failures if f.severity == Severity.CRITICAL
         ]
-        status = "fail" if critical_failures else "pass"
+        status = RunStatus.FAIL if critical_failures else RunStatus.PASS
 
         return EvalReport(
             status=status,

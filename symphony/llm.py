@@ -146,7 +146,7 @@ class LLMClient:
             from openai import OpenAI
         except ImportError:
             raise RuntimeError(
-                "openai package not installed. Run: pip install openai"
+                "openai package not installed. Run: uv sync --extra openai"
             )
         client = OpenAI(api_key=self._api_key)
         full_messages = []

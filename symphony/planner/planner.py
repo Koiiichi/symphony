@@ -6,7 +6,9 @@ import json
 import logging
 from typing import Optional, Tuple
 
+from symphony.llm import LLMClient
 from symphony.planner.schema import (
+    NodeType,
     TaskGraph,
 )
 from symphony.prompt.compiler import ContextBlock, PromptCompiler
@@ -86,7 +88,7 @@ class LLMPlanner:
 
     def __init__(
         self,
-        llm_client: "LLMClient",  # noqa: F821 — avoids circular import
+        llm_client: LLMClient,
         *,
         token_budget: Optional[int] = None,
     ):
@@ -101,7 +103,7 @@ class LLMPlanner:
         *,
         project_context: str = "",
         prior_failures: str = "",
-        project_path: Optional[str] = None,
+        max_retries: int = 3,
     ) -> Tuple[TaskGraph, Optional[float], int]:
         """Generate a TaskGraph for *goal*.
 
@@ -109,7 +111,9 @@ class LLMPlanner:
         the model's self-reported confidence (0-1) or None, and
         token_estimate is the estimated prompt tokens used.
 
-        Raises on LLM or parsing failure — no silent fallback.
+        Retries up to *max_retries* times on invalid LLM output (bad JSON,
+        schema violations, inconsistent edge references). Raises on
+        exhaustion or infrastructure errors.
         """
         blocks: list = []
         if project_context:
@@ -126,16 +130,54 @@ class LLMPlanner:
         system = messages[0]["content"] if messages and messages[0]["role"] == "system" else ""
         user_messages = [m for m in messages if m["role"] != "system"]
 
-        raw = self._client.complete(
-            user_messages, system=system, response_schema=TaskGraph
-        ).strip()
-        # Strip markdown fences if present (fallback for providers that ignore schema)
-        if raw.startswith("```"):
-            raw = raw.split("\n", 1)[1]
-            if raw.endswith("```"):
-                raw = raw[:-3]
-        data = json.loads(raw)
-        graph = TaskGraph.model_validate(data)
-        confidence = data.get("confidence")
-        logger.info("LLM planner produced graph with %d nodes", len(graph.nodes))
-        return graph, confidence, prompt_tokens
+        last_exc: Exception = RuntimeError("No attempts made")
+        retry_messages = list(user_messages)
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                raw = self._client.complete(
+                    retry_messages, system=system, response_schema=TaskGraph
+                ).strip()
+                # Strip markdown fences if present
+                if raw.startswith("```"):
+                    raw = raw.split("\n", 1)[1]
+                    if raw.endswith("```"):
+                        raw = raw[:-3]
+                data = json.loads(raw)
+                graph = TaskGraph.model_validate(data)
+                testable_types = {NodeType.WEB_FLOW_TEST, NodeType.API_CHECK}
+                if not any(n.type in testable_types for n in graph.nodes):
+                    raise ValueError(
+                        "TaskGraph has no web_flow_test or api_check nodes — "
+                        "add at least one node that executes and asserts."
+                    )
+                confidence = data.get("confidence")
+                if attempt > 1:
+                    logger.info("LLM planner succeeded on attempt %d", attempt)
+                logger.info("LLM planner produced graph with %d nodes", len(graph.nodes))
+                return graph, confidence, prompt_tokens
+            except Exception as exc:
+                last_exc = exc
+                if attempt < max_retries:
+                    logger.info(
+                        "Planner attempt %d/%d returned invalid graph: %s",
+                        attempt, max_retries, exc
+                    )
+                else:
+                    logger.warning(
+                        "Planner attempt %d/%d failed: %s", attempt, max_retries, exc
+                    )
+                if attempt < max_retries:
+                    # Feed the error back so the model can self-correct
+                    retry_messages = list(user_messages) + [
+                        {"role": "assistant", "content": raw if "raw" in dir() else ""},
+                        {"role": "user", "content": (
+                            f"Your response was invalid: {exc}\n"
+                            "Fix the issue and return a valid TaskGraph JSON. "
+                            "Ensure all edge source/target IDs exactly match node IDs."
+                        )},
+                    ]
+
+        raise RuntimeError(
+            f"LLM planner failed after {max_retries} attempts. Last error: {last_exc}"
+        )
