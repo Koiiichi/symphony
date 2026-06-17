@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 *.pyo
 .env
+.local.env
 .venv/
 venv/
 *.egg-info/
@@ -12,3 +13,5 @@ build/
 .DS_Store
 artifacts/
 *.har
+
+dev-notes.md 

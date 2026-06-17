@@ -281,6 +281,52 @@ class TestMultiStepFlow:
 
 
 # ------------------------------------------------------------------
+# Goal-claim verification guardrails
+# ------------------------------------------------------------------
+
+class TestGoalVerificationContract:
+    def test_dark_mode_goal_without_claim_coverage_fails(self):
+        flow_result = FlowResult(
+            script_name="test_theme_toggle",
+            passed=True,
+            results=[
+                ActionResult(
+                    action=FlowAction(action=ActionType.NAVIGATE, value="http://localhost:3000/index.html"),
+                    success=True,
+                    message="ok",
+                ),
+                ActionResult(
+                    action=FlowAction(
+                        action=ActionType.ASSERT_TEXT,
+                        selector="h1",
+                        value="Sign in",
+                    ),
+                    success=True,
+                    message="Text assertion passed for h1",
+                ),
+            ],
+            evidence=Evidence(screenshots=[Path("/tmp/theme_toggle.png")]),
+        )
+
+        evaluator = ReliabilityEvaluator()
+        report = evaluator.evaluate(
+            [flow_result],
+            verification_claims=[
+                {
+                    "id": "dark_mode_toggleable",
+                    "description": "Login page supports dark mode toggling",
+                    "required": True,
+                }
+            ],
+        )
+        assert not report.passed
+        assert any(
+            f.id == "goal_not_verified:dark_mode_toggleable"
+            for f in report.failing_reasons
+        )
+
+
+# ------------------------------------------------------------------
 # Token budget regression
 # ------------------------------------------------------------------
 
@@ -334,3 +380,28 @@ class TestPlannerErrors:
         planner = LLMPlanner(mock_client)
         with pytest.raises(RuntimeError, match="API down"):
             planner.plan("test goal")
+
+    def test_llm_planner_rejects_missing_verification_contract(self):
+        mock_client = MagicMock()
+        mock_client.complete.return_value = json.dumps(
+            {
+                "version": "2.0",
+                "goal": "Verify dark mode toggle on login page",
+                "nodes": [
+                    {
+                        "id": "theme_test",
+                        "type": "web_flow_test",
+                        "actions": [
+                            {"action": "navigate", "value": "http://localhost:3000/index.html"}
+                        ],
+                        "assertions": [
+                            {"action": "assert_text", "selector": "h1", "value": "Sign in"}
+                        ],
+                    }
+                ],
+                "edges": [],
+            }
+        )
+        planner = LLMPlanner(mock_client)
+        with pytest.raises(RuntimeError, match="verification_contract"):
+            planner.plan("test goal", max_retries=1)

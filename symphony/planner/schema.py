@@ -131,8 +131,23 @@ class TaskNode(BaseModel):
         if self.type == NodeType.WEB_FLOW_TEST:
             if not self.actions:
                 raise ValueError("web_flow_test node must declare actions")
-            if not self.assertions:
-                raise ValueError("web_flow_test node must declare assertions")
+            _assertion_types = {"assert_text", "assert_http_status", "assert_banner"}
+            has_inline = any(a.action.value in _assertion_types for a in self.actions)
+            if not self.assertions and not has_inline:
+                raise ValueError(
+                    "web_flow_test node must have at least one assertion "
+                    "(either in 'assertions' or inline in 'actions')"
+                )
+        if self.type == NodeType.API_CHECK:
+            missing = [
+                f for f in ("url", "method", "expected_status")
+                if not self.config.get(f)
+            ]
+            if missing:
+                raise ValueError(
+                    f"api_check node '{self.id}' is missing required config fields: "
+                    + ", ".join(missing)
+                )
         if self.type == NodeType.OTHER and not self.other_task_type:
             raise ValueError(
                 "other node must specify other_task_type describing the task"
@@ -171,6 +186,25 @@ class AcceptanceCriterion(BaseModel):
 
 
 # ------------------------------------------------------------------
+# Verification contract
+# ------------------------------------------------------------------
+
+class VerificationClaim(BaseModel):
+    model_config = ConfigDict(json_schema_extra={})
+
+    id: str = Field(description="Short unique identifier for this claim.")
+    description: str = Field(
+        description=(
+            "Atomic user-goal claim that must be verified by executable assertions."
+        )
+    )
+    required: bool = Field(
+        default=True,
+        description="If true, this claim must be covered and satisfied.",
+    )
+
+
+# ------------------------------------------------------------------
 # Top-level TaskGraph
 # ------------------------------------------------------------------
 
@@ -195,6 +229,13 @@ class TaskGraph(BaseModel):
         default_factory=list,
         description="Criteria that must all pass for the run to be considered successful.",
     )
+    verification_contract: list[VerificationClaim] = Field(
+        default_factory=list,
+        description=(
+            "Goal verification claims. Required claims must be linked from at least "
+            "one assertion via params.claim_id."
+        ),
+    )
 
     @model_validator(mode="after")
     def _validate_edge_refs(self) -> "TaskGraph":
@@ -208,6 +249,50 @@ class TaskGraph(BaseModel):
                 raise ValueError(
                     f"Edge target '{edge.target}' not found in nodes"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_verification_contract(self) -> "TaskGraph":
+        if not self.verification_contract:
+            return self
+
+        claim_ids: set[str] = set()
+        for claim in self.verification_contract:
+            if claim.id in claim_ids:
+                raise ValueError(
+                    f"Duplicate verification claim id '{claim.id}'"
+                )
+            claim_ids.add(claim.id)
+
+        linked_claims: set[str] = set()
+        for node in self.nodes:
+            for action in list(node.assertions) + list(node.actions):
+                claim_id = action.params.get("claim_id")
+                if not claim_id:
+                    continue
+                linked_claims.add(str(claim_id))
+
+            # API checks can link directly through node config.
+            if node.type == NodeType.API_CHECK:
+                claim_id = node.config.get("claim_id")
+                if claim_id:
+                    linked_claims.add(str(claim_id))
+
+        unknown_claims = sorted(linked_claims - claim_ids)
+        if unknown_claims:
+            raise ValueError(
+                "Assertions reference unknown verification claim ids: "
+                + ", ".join(unknown_claims)
+            )
+
+        required_claims = {c.id for c in self.verification_contract if c.required}
+        missing_required = sorted(required_claims - linked_claims)
+        if missing_required:
+            raise ValueError(
+                "Required verification claim ids are not linked to executable checks: "
+                + ", ".join(missing_required)
+            )
+
         return self
 
     def topo_order(self) -> list[str]:

@@ -309,6 +309,22 @@ def _print_report(report: dict):
             a_msg = a_msg[:150] + "..."
         console.print(f"  [{icon}] {a.get('assertion_id', '?')}: {a_msg}", highlight=False)
 
+    claims = report.get("claim_results", [])
+    if claims:
+        satisfied = sum(1 for c in claims if c.get("passed"))
+        console.print(f"\n[bold]Goal claims: {satisfied}/{len(claims)} satisfied[/]")
+        for c in claims:
+            icon = "[green]+[/]" if c.get("passed") else "[red]-[/]"
+            req = "required" if c.get("required", True) else "optional"
+            coverage = "covered" if c.get("covered", False) else "uncovered"
+            desc = c.get("description", "")
+            if len(desc) > 120:
+                desc = desc[:120] + "..."
+            console.print(
+                f"  [{icon}] {c.get('claim_id', '?')} ({req}, {coverage}): {desc}",
+                highlight=False,
+            )
+
     usage = report.get("token_usage", {})
     if usage:
         total = usage.get("total", 0)

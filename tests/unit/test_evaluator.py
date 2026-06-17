@@ -9,6 +9,7 @@ from typing import List, Optional, Tuple
 from symphony.evaluator.evaluator import (
     Artifact,
     AssertionResult,
+    ClaimResult,
     EvalReport,
     FailureReason,
     ReliabilityEvaluator,
@@ -163,6 +164,7 @@ class TestReliabilityEvaluator:
         assert d["status"] == "fail"
         assert isinstance(d["failing_reasons"], list)
         assert isinstance(d["assertion_results"], list)
+        assert isinstance(d["claim_results"], list)
         assert isinstance(d["artifacts"], list)
 
 
@@ -180,6 +182,23 @@ class TestEvalReport:
         d = r.to_dict()
         assert d["status"] == "pass"
         assert d["failing_reasons"] == []
+
+    def test_claim_result_roundtrip(self):
+        r = EvalReport(
+            status=RunStatus.PASS,
+            claim_results=[
+                ClaimResult(
+                    claim_id="c1",
+                    description="desc",
+                    required=True,
+                    covered=True,
+                    passed=True,
+                    assertion_ids=["a1"],
+                )
+            ],
+        )
+        d = r.to_dict()
+        assert d["claim_results"][0]["claim_id"] == "c1"
 
 
 class TestFalsePositiveGuardrails:
@@ -209,3 +228,97 @@ class TestFalsePositiveGuardrails:
         )
         report = ev.evaluate([flow])
         assert not report.passed
+
+    def test_required_claim_without_coverage_fails(self):
+        ev = ReliabilityEvaluator()
+        flow = _make_flow_result(actions=[("navigate", True, "ok")])
+        report = ev.evaluate(
+            [flow],
+            verification_claims=[
+                {
+                    "id": "dark_mode_toggleable",
+                    "description": "Dark mode can be toggled",
+                    "required": True,
+                }
+            ],
+        )
+        assert not report.passed
+        assert any(
+            r.id == "goal_not_verified:dark_mode_toggleable"
+            for r in report.failing_reasons
+        )
+
+    def test_required_claim_with_passing_assertion_passes(self):
+        ev = ReliabilityEvaluator()
+        flow = FlowResult(
+            script_name="theme_test",
+            passed=True,
+            results=[
+                ActionResult(
+                    action=FlowAction(action=ActionType.NAVIGATE, value="http://localhost"),
+                    success=True,
+                    message="ok",
+                ),
+                ActionResult(
+                    action=FlowAction(
+                        action=ActionType.ASSERT_TEXT,
+                        selector="body",
+                        value="Dark mode enabled",
+                        params={"claim_id": "dark_mode_toggleable"},
+                    ),
+                    success=True,
+                    message="Dark mode text found",
+                ),
+            ],
+            evidence=Evidence(screenshots=[Path("/tmp/theme.png")]),
+        )
+        report = ev.evaluate(
+            [flow],
+            verification_claims=[
+                {
+                    "id": "dark_mode_toggleable",
+                    "description": "Dark mode can be toggled",
+                    "required": True,
+                }
+            ],
+        )
+        assert report.passed
+        assert len(report.claim_results) == 1
+        assert report.claim_results[0].covered is True
+        assert report.claim_results[0].passed is True
+
+    def test_unknown_claim_reference_is_critical(self):
+        ev = ReliabilityEvaluator()
+        flow = FlowResult(
+            script_name="theme_test",
+            passed=False,
+            results=[
+                ActionResult(
+                    action=FlowAction(
+                        action=ActionType.ASSERT_TEXT,
+                        selector="body",
+                        value="ok",
+                        params={"claim_id": "unknown_claim"},
+                    ),
+                    success=True,
+                    message="ok",
+                )
+            ],
+            evidence=Evidence(screenshots=[Path("/tmp/theme.png")]),
+        )
+        report = ev.evaluate(
+            [flow],
+            verification_claims=[
+                {
+                    "id": "dark_mode_toggleable",
+                    "description": "Dark mode can be toggled",
+                    "required": True,
+                }
+            ],
+        )
+        assert not report.passed
+        assert any(
+            r.id == "unknown_claim_reference:unknown_claim"
+            and r.severity == Severity.CRITICAL
+            for r in report.failing_reasons
+        )

@@ -57,6 +57,7 @@ class FlowResult:
     passed: bool
     results: list[ActionResult] = field(default_factory=list)
     evidence: Evidence = field(default_factory=Evidence)
+    node_type: str = ""  # e.g. "api_check" — used to suppress irrelevant warnings
 
     @property
     def failures(self) -> list[ActionResult]:
@@ -180,10 +181,14 @@ class FlowExecutor:
         except Exception as exc:
             elapsed = (time.monotonic() - t0) * 1000
             evidence = self._collect_evidence(action)
+            console_errors = self._harvest_console_logs()
+            base_msg = self._format_error(exc, action)
+            if console_errors:
+                base_msg += " | JS console: " + "; ".join(console_errors[-5:])
             return ActionResult(
                 action=action,
                 success=False,
-                message=self._format_error(exc, action),
+                message=base_msg,
                 elapsed_ms=elapsed,
                 evidence=evidence,
             )
@@ -398,12 +403,47 @@ class FlowExecutor:
     }
     """
 
+    _CONSOLE_CAPTURE_JS = """
+    if (!window.__symphonyConsoleLogs) {
+        window.__symphonyConsoleLogs = [];
+        const _origError = console.error.bind(console);
+        const _origWarn  = console.warn.bind(console);
+        console.error = function(...args) {
+            window.__symphonyConsoleLogs.push('ERROR: ' + args.map(String).join(' '));
+            _origError(...args);
+        };
+        console.warn = function(...args) {
+            window.__symphonyConsoleLogs.push('WARN: ' + args.map(String).join(' '));
+            _origWarn(...args);
+        };
+        window.addEventListener('error', function(e) {
+            window.__symphonyConsoleLogs.push('UNCAUGHT: ' + e.message + (e.filename ? ' (' + e.filename + ':' + e.lineno + ')' : ''));
+        });
+        window.addEventListener('unhandledrejection', function(e) {
+            window.__symphonyConsoleLogs.push('UNHANDLED_REJECTION: ' + String(e.reason));
+        });
+    }
+    """
+
     def _inject_network_interceptor(self) -> None:
-        """Inject JS that records fetch/XHR response status codes."""
+        """Inject JS that records fetch/XHR response status codes and console errors."""
         try:
             self._driver.execute_script(self._INTERCEPTOR_JS)
+            self._driver.execute_script(self._CONSOLE_CAPTURE_JS)
         except WebDriverException:
             pass
+
+    def _harvest_console_logs(self) -> list[str]:
+        """Pull captured console errors/warnings from the page."""
+        try:
+            logs = self._driver.execute_script(
+                "var l = window.__symphonyConsoleLogs || [];"
+                "window.__symphonyConsoleLogs = [];"
+                "return l;"
+            )
+            return logs if isinstance(logs, list) else []
+        except WebDriverException:
+            return []
 
     def _harvest_responses(self) -> list[dict[str, Any]]:
         """Pull captured responses from the injected interceptor."""

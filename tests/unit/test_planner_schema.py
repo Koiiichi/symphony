@@ -11,6 +11,7 @@ from symphony.planner.schema import (
     TaskEdge,
     TaskGraph,
     TaskNode,
+    VerificationClaim,
 )
 
 
@@ -34,7 +35,7 @@ class TestTaskNode:
             )
 
     def test_web_flow_test_requires_assertions(self):
-        with pytest.raises(ValidationError, match="must declare assertions"):
+        with pytest.raises(ValidationError, match="must have at least one assertion"):
             TaskNode(
                 id="n1",
                 type=NodeType.WEB_FLOW_TEST,
@@ -72,6 +73,7 @@ class TestTaskNode:
     def test_custom_retry(self):
         node = TaskNode(
             id="n1", type=NodeType.API_CHECK,
+            config={"url": "http://localhost:3000/api/test", "method": "GET", "expected_status": 200},
             retry=RetryPolicy(max_attempts=5, backoff_seconds=2.0),
         )
         assert node.retry.max_attempts == 5
@@ -167,6 +169,53 @@ class TestTaskGraph:
         g2 = TaskGraph.model_validate(data)
         assert g2.goal == g.goal
         assert len(g2.nodes) == len(g.nodes)
+
+    def test_required_claim_must_be_linked(self):
+        with pytest.raises(ValidationError, match="not linked to executable checks"):
+            TaskGraph(
+                goal="verify dark mode toggle",
+                nodes=[
+                    TaskNode(
+                        id="theme_test",
+                        type=NodeType.WEB_FLOW_TEST,
+                        actions=[{"action": "navigate", "value": "http://localhost:3000/login.html"}],
+                        assertions=[
+                            {
+                                "action": "assert_text",
+                                "selector": "h1",
+                                "value": "Sign in",
+                            }
+                        ],
+                    )
+                ],
+                verification_contract=[
+                    VerificationClaim(id="dark_mode_toggleable", description="Dark mode can be toggled"),
+                ],
+            )
+
+    def test_unknown_claim_reference_rejected(self):
+        with pytest.raises(ValidationError, match="unknown verification claim ids"):
+            TaskGraph(
+                goal="verify dark mode toggle",
+                nodes=[
+                    TaskNode(
+                        id="theme_test",
+                        type=NodeType.WEB_FLOW_TEST,
+                        actions=[{"action": "navigate", "value": "http://localhost:3000/login.html"}],
+                        assertions=[
+                            {
+                                "action": "assert_text",
+                                "selector": "h1",
+                                "value": "Sign in",
+                                "params": {"claim_id": "missing_claim"},
+                            }
+                        ],
+                    )
+                ],
+                verification_contract=[
+                    VerificationClaim(id="dark_mode_toggleable", description="Dark mode can be toggled"),
+                ],
+            )
 
 
 # ------------------------------------------------------------------

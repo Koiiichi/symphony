@@ -23,9 +23,10 @@ from symphony.patching.policy import EditMode, PatchDecision, PatchPolicy
 from symphony.llm import LLMClient
 from symphony.planner.schema import NodeType, TaskNode
 from symphony.planner.planner import LLMPlanner
+from symphony.planner.validator import validate_graph
 from symphony.flow.dsl import ActionType, FlowAction, FlowScript
 from symphony.flow.executor import ActionResult, FlowExecutor, FlowResult
-from symphony.evaluator.evaluator import ReliabilityEvaluator
+from symphony.evaluator.evaluator import ReliabilityEvaluator, RunStatus
 from symphony.prompt.compiler import ContextBlock, PromptCompiler
 
 
@@ -90,7 +91,37 @@ class Orchestrator:
         self._request_patch_approval = request_patch_approval
         self._patch_records: list[dict[str, Any]] = []
         self._manual_approval_blocked = False
+        self._base_url: str = ""
+        self._auth_token: str = ""  # Last bearer token seen in browser storage
+        self._driver = None  # Shared browser driver across web_flow_test nodes
         self._emit: ProgressCallback = _noop_callback
+
+    # ---- Graph utilities ----
+
+    @staticmethod
+    def _resolve_base_url(graph) -> str:
+        """Derive base_url from the first service_start node that specifies a port."""
+        for node in graph.nodes:
+            if node.type != NodeType.SERVICE_START:
+                continue
+            for cmd_spec in node.config.get("commands", []):
+                cmd = cmd_spec if isinstance(cmd_spec, str) else cmd_spec.get("cmd", "")
+                port = Orchestrator._infer_port_from_command(cmd)
+                if port:
+                    return f"http://localhost:{port}"
+        return ""
+
+    @staticmethod
+    def _normalize_navigations(graph, base_url: str) -> None:
+        """Rewrite relative navigate values to absolute URLs in-place."""
+        if not base_url:
+            return
+        for node in graph.nodes:
+            for action in node.actions:
+                if action.action == ActionType.NAVIGATE and action.value:
+                    url = action.value.strip()
+                    if not url.startswith(("http://", "https://", "file://")):
+                        action.value = base_url.rstrip("/") + "/" + url.lstrip("/")
 
     def run(
         self,
@@ -113,11 +144,78 @@ class Orchestrator:
             emit("phase", "Planning")
             emit("detail", "Gathering project context...")
             project_context = self._gather_project_context()
+
+            # Perception-first: start the service and observe the live DOM so the
+            # planner is grounded in real selectors and a running app.
+            emit("detail", "Starting service for perception...")
+            perception_base_url = self._ensure_service_started()
+            if perception_base_url:
+                emit("detail", "Observing live pages...")
+                ui_map = self._run_perception(perception_base_url)
+                if ui_map:
+                    project_context += (
+                        "\n\n=== LIVE UI MAP (observed from the running app — "
+                        "use ONLY these selectors and pages) ===\n" + ui_map
+                    )
+                    emit("detail", "Live UI map captured")
+
             emit("detail", "Generating task graph via LLM...")
-            graph, confidence, planner_tokens = planner.plan(
-                goal,
-                project_context=project_context,
-            )
+
+            _MAX_PLAN_ATTEMPTS = 3
+            graph = confidence = None
+            planner_tokens = 0
+            prior_failures_for_replan = ""
+            for _plan_attempt in range(1, _MAX_PLAN_ATTEMPTS + 1):
+                graph, confidence, pt = planner.plan(
+                    goal,
+                    project_context=project_context,
+                    prior_failures=prior_failures_for_replan,
+                )
+                planner_tokens += pt
+                base_url = self._resolve_base_url(graph) or self._base_url
+                self._base_url = base_url
+                self._normalize_navigations(graph, base_url)
+                validation_errors = validate_graph(graph, base_url=base_url)
+                if not validation_errors:
+                    break
+                logger.warning(
+                    "Graph validation failed (attempt %d/%d): %s",
+                    _plan_attempt, _MAX_PLAN_ATTEMPTS, validation_errors,
+                )
+                emit("detail", f"Plan attempt {_plan_attempt} invalid, replanning...")
+                prior_failures_for_replan = (
+                    "The previous plan was rejected by the pre-execution validator. "
+                    "Fix all of the following issues:\n"
+                    + "\n".join(f"- {e}" for e in validation_errors)
+                )
+                if _plan_attempt == _MAX_PLAN_ATTEMPTS:
+                    self._total_tokens += planner_tokens
+                    report_dict = {
+                        "status": RunStatus.EXECUTION_PLAN_INVALID.value,
+                        "failing_reasons": [
+                            {
+                                "id": "execution_plan_invalid",
+                                "severity": "critical",
+                                "message": (
+                                    f"TaskGraph rejected after {_MAX_PLAN_ATTEMPTS} planning "
+                                    f"attempts. Last validation errors: "
+                                    + "; ".join(validation_errors)
+                                ),
+                                "node_id": None,
+                                "evidence_path": None,
+                            }
+                        ],
+                        "assertion_results": [],
+                        "claim_results": [],
+                        "artifacts": [],
+                        "patches": [],
+                        "token_usage": {"total": self._total_tokens},
+                        "planner_confidence": None,
+                    }
+                    self._save_artifact("report.json", json.dumps(report_dict, indent=2))
+                    emit("done", RunStatus.EXECUTION_PLAN_INVALID.value)
+                    return report_dict
+
             self._total_tokens += planner_tokens
             self._save_artifact("taskgraph.json", graph.model_dump_json(indent=2))
             emit("plan_ready", f"{len(graph.nodes)} nodes planned")
@@ -149,6 +247,10 @@ class Orchestrator:
                             flow_results.append(result)
                             status = "pass" if result.passed else "fail"
                             emit("node_result", f"{node.id}: {status} ({len(result.failures)} failures)")
+                        # Harvest any auth token the browser flow may have stored.
+                        token = self._extract_browser_auth_token()
+                        if token:
+                            self._auth_token = token
                     elif nt == NodeType.API_CHECK:
                         result = self._execute_api_check(node)
                         if result:
@@ -178,6 +280,7 @@ class Orchestrator:
                 emit("phase", "Evaluating results")
                 report = evaluator.evaluate(
                     flow_results,
+                    verification_claims=graph.verification_contract,
                     token_usage={"total": self._total_tokens},
                     planner_confidence=confidence,
                 )
@@ -202,6 +305,7 @@ class Orchestrator:
                     emit("node_result", f"auto_patch_pass_{pass_num}: done")
 
                     flow_results.clear()
+                    self._quit_driver()  # Fresh browser for next pass
 
             # ---- Save report ----
             report_dict = report.to_dict()
@@ -224,6 +328,29 @@ class Orchestrator:
                 report_dict["status"] = "fail"
             self._save_artifact("report.json", json.dumps(report_dict, indent=2))
             emit("done", report_dict.get("status", "unknown"))
+            return report_dict
+        except RuntimeError as exc:
+            # LLMPlanner exhausted all retries — distinguish this from an app failure.
+            report_dict = {
+                "status": RunStatus.PLANNER_INVALID.value,
+                "failing_reasons": [
+                    {
+                        "id": "planner_invalid",
+                        "severity": "critical",
+                        "message": str(exc),
+                        "node_id": None,
+                        "evidence_path": None,
+                    }
+                ],
+                "assertion_results": [],
+                "claim_results": [],
+                "artifacts": [],
+                "patches": [],
+                "token_usage": {"total": self._total_tokens},
+                "planner_confidence": None,
+            }
+            self._save_artifact("report.json", json.dumps(report_dict, indent=2))
+            emit("done", RunStatus.PLANNER_INVALID.value)
             return report_dict
         finally:
             self._stop_services()
@@ -264,8 +391,12 @@ class Orchestrator:
         logger.info("Stack detected: %s, frameworks: %s", detected, frameworks)
         return result
 
-    def _execute_service_start(self, node) -> None:
-        commands = node.config.get("commands", [])
+    def _detect_service_commands(self, node=None) -> list[dict[str, Any]]:
+        """Determine service start commands from a node config or by inspecting the project.
+
+        Works without a node so the service can be started before planning.
+        """
+        commands = list(node.config.get("commands", [])) if node is not None else []
         if not commands:
             pkg = self._project / "package.json"
             if pkg.exists():
@@ -292,11 +423,13 @@ class Orchestrator:
             )
             health_url = cmd_spec.get("health_url") if isinstance(cmd_spec, dict) else None
             specs.append({"cmd": cmd, "cwd": cwd, "health_url": health_url})
+        return specs
 
-        if not specs:
-            logger.warning("No service commands found for service_start node '%s'", node.id)
-            return
+    def _services_running(self) -> bool:
+        """True if we have at least one live tracked service process."""
+        return any(p.poll() is None for p in self._service_processes)
 
+    def _start_services_from_specs(self, specs: list[dict[str, Any]]) -> None:
         self._service_commands = specs
         self._stop_services()
         for spec in self._service_commands:
@@ -304,6 +437,41 @@ class Orchestrator:
             if proc is not None:
                 self._service_processes.append(proc)
         self._wait_for_services(self._service_commands)
+
+    def _ensure_service_started(self) -> str:
+        """Start the project's service if not already running. Returns base_url or ''.
+
+        Called before planning so perception and execution always have a live
+        service, regardless of whether the planner emitted a service_start node.
+        """
+        if self._services_running():
+            return self._base_url
+        specs = self._detect_service_commands()
+        if not specs:
+            logger.info("No service command detected; skipping pre-plan service start")
+            return ""
+        self._start_services_from_specs(specs)
+        # Derive base_url from the first command's inferred port.
+        for spec in specs:
+            port = self._infer_port_from_command(spec["cmd"])
+            if port:
+                self._base_url = f"http://localhost:{port}"
+                break
+        return self._base_url
+
+    def _execute_service_start(self, node) -> None:
+        specs = self._detect_service_commands(node)
+        if not specs:
+            logger.warning("No service commands found for service_start node '%s'", node.id)
+            return
+
+        # Idempotent: if the service is already up (started pre-plan), don't restart.
+        if self._services_running():
+            logger.info("Service already running; service_start node '%s' is a no-op", node.id)
+            self._service_commands = specs
+            return
+
+        self._start_services_from_specs(specs)
 
     def _spawn_service(self, cmd: str, cwd: str) -> Optional[subprocess.Popen]:
         logger.info("Starting service: %s (cwd=%s)", cmd, cwd)
@@ -329,18 +497,97 @@ class Orchestrator:
 
     def _execute_ui_discovery(self, node) -> Dict[str, Any]:
         logger.info("UI discovery: %s", node.description)
-        return {"discovered": True}
+        result: dict[str, Any] = {
+            "node_id": node.id,
+            "description": node.description,
+            "discovered": False,
+            "theme_candidates": [],
+        }
+        try:
+            driver = self._get_shared_driver()
+            url = node.config.get("url")
+            if url:
+                driver.get(url)
+
+                candidates = driver.execute_script(
+                    """
+                    const selectors = [
+                      "[role='switch']",
+                      "input[type='checkbox']",
+                      "[aria-label*='theme' i]",
+                      "[aria-label*='dark' i]",
+                      "[id*='theme' i]",
+                      "[id*='dark' i]",
+                      "[class*='theme' i]",
+                      "[class*='dark' i]",
+                      "[data-theme]",
+                      "[data-mode]"
+                    ];
+                    const seen = new Set();
+                    const out = [];
+                    for (const selector of selectors) {
+                      for (const el of document.querySelectorAll(selector)) {
+                        if (seen.has(el)) continue;
+                        seen.add(el);
+                        out.push({
+                          selector,
+                          tag: el.tagName.toLowerCase(),
+                          id: el.id || null,
+                          classes: (el.className || "").toString().slice(0, 120),
+                          role: el.getAttribute("role"),
+                          aria_label: el.getAttribute("aria-label"),
+                          text: (el.innerText || "").trim().slice(0, 120)
+                        });
+                        if (out.length >= 25) return out;
+                      }
+                    }
+                    return out;
+                    """
+                )
+                result.update(
+                    {
+                        "discovered": True,
+                        "url": driver.current_url,
+                        "page_title": driver.title,
+                        "theme_candidates": candidates if isinstance(candidates, list) else [],
+                    }
+                )
+        except Exception as exc:
+            result["error"] = str(exc)
+            logger.warning("UI discovery node %s failed: %s", node.id, exc)
+
+        self._save_artifact(
+            f"ui_discovery_{node.id}.json",
+            json.dumps(result, indent=2),
+        )
+        return result
 
     def _execute_web_flow(self, node) -> Optional[FlowResult]:
         if not node.actions:
             logger.warning("Node %s has no actions, skipping", node.id)
             return None
 
-        actions = list(node.actions) + list(node.assertions)
+        actions = list(node.actions)
+
+        # Auto-prepend a navigate if a start URL is configured and the flow
+        # doesn't already begin with one. Accept common key variants.
+        config_url = (
+            node.config.get("url")
+            or node.config.get("start_url")
+            or node.config.get("base_url")
+            or ""
+        )
+        if config_url and (not actions or actions[0].action != ActionType.NAVIGATE):
+            # Resolve relative URLs the same way as _normalize_navigations.
+            if not config_url.startswith(("http://", "https://")):
+                config_url = self._base_url.rstrip("/") + "/" + config_url.lstrip("/")
+            actions.insert(0, FlowAction(action=ActionType.NAVIGATE, value=config_url))
+
+        actions = actions + list(node.assertions)
 
         script = FlowScript(name=node.id, description=node.description, actions=actions)
         try:
-            driver = self._get_driver()
+            driver = self._get_shared_driver()
             executor = FlowExecutor(
                 driver,
                 self._artifact_dir / node.id,
@@ -365,6 +612,7 @@ class Orchestrator:
 
     def _stop_services(self) -> None:
         """Terminate any services that were started by this run."""
+        self._quit_driver()
         if not self._service_processes:
             return
 
@@ -471,6 +719,17 @@ class Orchestrator:
         body = node.config.get("body")
         headers = node.config.get("headers", {})
         expected_status = node.config.get("expected_status", 200)
+        claim_id = node.config.get("claim_id")
+
+        # Resolve relative URLs using the base_url derived from service_start.
+        if url and not url.startswith(("http://", "https://")):
+            base = getattr(self, "_base_url", "")
+            if base:
+                url = base.rstrip("/") + "/" + url.lstrip("/")
+
+        # Inject the last-seen browser auth token when the plan doesn't supply one.
+        if self._auth_token and "Authorization" not in headers:
+            headers = {**headers, "Authorization": f"Bearer {self._auth_token}"}
 
         if not url:
             logger.warning("API check node %s has no URL", node.id)
@@ -511,7 +770,10 @@ class Orchestrator:
             action = FlowAction(
                 action=ActionType.ASSERT_HTTP_STATUS,
                 value=str(expected_status),
-                params={"url_pattern": url},
+                params={
+                    "url_pattern": url,
+                    **({"claim_id": claim_id} if claim_id else {}),
+                },
             )
             passed = actual_status == expected_status
             msg = (
@@ -524,6 +786,7 @@ class Orchestrator:
             script_name=node.id,
             passed=ar.success,
             results=[ar],
+            node_type="api_check",
         )
         return result
 
@@ -539,6 +802,24 @@ class Orchestrator:
             return
 
         blocks = [ContextBlock(name="Failures", content="\n".join(failure_evidence), priority=20)]
+
+        # Include diffs from previously applied patches so the LLM knows what
+        # it already tried (and failed) and can avoid repeating or compounding them.
+        prior_diffs: list[str] = []
+        for record in self._patch_records:
+            if record.get("decision") == PatchDecision.APPLIED.value:
+                diff_path = record.get("diff_path")
+                if diff_path:
+                    try:
+                        prior_diffs.append(Path(diff_path).read_text())
+                    except OSError:
+                        pass
+        if prior_diffs:
+            blocks.append(ContextBlock(
+                name="Previously applied patches (did NOT fully fix the problem — do not repeat or build on mistakes)",
+                content="\n---\n".join(prior_diffs),
+                priority=15,
+            ))
 
         # Use explicitly listed files, or fall back to auto-discovering server-side
         # source files in the project (excluding node_modules, dist, etc.)
@@ -690,6 +971,152 @@ class Orchestrator:
         opts.add_argument("--no-sandbox")
         opts.add_argument("--disable-dev-shm-usage")
         return webdriver.Chrome(options=opts)
+
+    def _get_shared_driver(self):
+        """Return the run-scoped browser driver, creating it on first call."""
+        if self._driver is None:
+            self._driver = self._get_driver()
+        return self._driver
+
+    def _quit_driver(self) -> None:
+        if self._driver is not None:
+            try:
+                self._driver.quit()
+            except Exception:
+                pass
+            self._driver = None
+
+    def _extract_browser_auth_token(self) -> str:
+        """Read authToken from the shared browser's localStorage/sessionStorage."""
+        if not self._base_url or self._driver is None:
+            return ""
+        try:
+            token = self._driver.execute_script(
+                "return localStorage.getItem('authToken') "
+                "|| sessionStorage.getItem('authToken') || '';"
+            )
+            return token or ""
+        except Exception as exc:
+            logger.debug("Could not extract auth token from browser storage: %s", exc)
+            return ""
+
+    # --- PERCEPTION-FIRST PLANNING ---
+
+    _PERCEPTION_JS = """
+    function describe(el) {
+      const attrs = {};
+      for (const a of ['id','name','type','placeholder','href','role','aria-label']) {
+        const v = el.getAttribute(a);
+        if (v) attrs[a] = v;
+      }
+      for (const a of el.getAttributeNames()) {
+        if (a.startsWith('data-')) attrs[a] = el.getAttribute(a);
+      }
+      return {
+        tag: el.tagName.toLowerCase(),
+        attrs: attrs,
+        text: (el.innerText || el.value || '').trim().slice(0, 80)
+      };
+    }
+    const out = {inputs: [], buttons: [], links: [], ids: []};
+    document.querySelectorAll('input, textarea, select').forEach(e => out.inputs.push(describe(e)));
+    document.querySelectorAll('button, [type=submit]').forEach(e => out.buttons.push(describe(e)));
+    document.querySelectorAll('a[href]').forEach(e => out.links.push(describe(e)));
+    document.querySelectorAll('[id]').forEach(e => out.ids.push(e.id));
+    return out;
+    """
+
+    def _discover_html_pages(self) -> list[str]:
+        """Return relative web paths of HTML pages in the project (public-dir aware)."""
+        skip_dirs = {"node_modules", ".git", "dist", "build", "vendor", ".venv", "artifacts", "__pycache__"}
+        pages: list[str] = []
+        for dirpath, dirnames, filenames in os.walk(str(self._project)):
+            dirnames[:] = [d for d in dirnames if d not in skip_dirs and not d.startswith(".")]
+            for fname in sorted(filenames):
+                if not fname.endswith(".html"):
+                    continue
+                rel = (Path(dirpath) / fname).relative_to(self._project)
+                parts = list(rel.parts)
+                if parts and parts[0] in ("public", "static", "dist", "www"):
+                    parts = parts[1:]
+                web_path = "/".join(parts)
+                if web_path not in pages:
+                    pages.append(web_path)
+        return pages[:8]
+
+    def _run_perception(self, base_url: str) -> str:
+        """Load each HTML page in a real browser and extract a live UI map.
+
+        Returns a formatted context block, or '' if perception is not possible
+        (no base_url, no driver, or no pages).
+        """
+        if not base_url:
+            return ""
+        pages = self._discover_html_pages()
+        if not pages:
+            return ""
+        try:
+            driver = self._get_shared_driver()
+        except Exception as exc:
+            logger.warning("Perception skipped (no browser driver): %s", exc)
+            return ""
+
+        sections: list[str] = []
+        for page in pages:
+            url = base_url.rstrip("/") + "/" + page.lstrip("/")
+            try:
+                driver.get(url)
+                ui = driver.execute_script(self._PERCEPTION_JS)
+            except Exception as exc:
+                logger.debug("Perception failed for %s: %s", url, exc)
+                continue
+            sections.append(self._format_ui_map(page, url, ui))
+
+        if not sections:
+            return ""
+        perception_block = "\n\n".join(sections)
+        self._save_artifact("perception.txt", perception_block)
+        return perception_block
+
+    @staticmethod
+    def _format_ui_map(page: str, url: str, ui: dict) -> str:
+        """Render the extracted DOM map as compact planner-friendly text."""
+        ui = ui or {}
+        lines = [f"=== Live page: /{page} ({url}) ==="]
+
+        def sel(item: dict) -> str:
+            attrs = item.get("attrs", {})
+            if attrs.get("id"):
+                return f"#{attrs['id']}"
+            if attrs.get("name"):
+                return f"{item.get('tag', '*')}[name=\"{attrs['name']}\"]"
+            for k, v in attrs.items():
+                if k.startswith("data-"):
+                    return f"{item.get('tag', '*')}[{k}=\"{v}\"]"
+            return item.get("tag", "*")
+
+        inputs = ui.get("inputs", [])
+        if inputs:
+            lines.append("Inputs:")
+            for it in inputs[:25]:
+                a = it.get("attrs", {})
+                desc = " ".join(filter(None, [a.get("type"), a.get("placeholder")]))
+                lines.append(f"  {sel(it)}  {desc}".rstrip())
+        buttons = ui.get("buttons", [])
+        if buttons:
+            lines.append("Buttons:")
+            for it in buttons[:25]:
+                lines.append(f"  {sel(it)}  \"{it.get('text', '')}\"".rstrip())
+        links = ui.get("links", [])
+        if links:
+            lines.append("Links:")
+            for it in links[:25]:
+                href = it.get("attrs", {}).get("href", "")
+                lines.append(f"  a[href=\"{href}\"]  \"{it.get('text', '')}\"".rstrip())
+        ids = ui.get("ids", [])
+        if ids:
+            lines.append("Element IDs present: " + ", ".join(f"#{i}" for i in ids[:40]))
+        return "\n".join(lines)
 
     def _gather_project_context(self) -> str:
         parts = []

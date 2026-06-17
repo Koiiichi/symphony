@@ -134,6 +134,66 @@ class LLMClient:
 
     # ---- provider implementations ----------------------------------
 
+    # Models that use max_completion_tokens instead of max_tokens.
+    # Any o-series or newer gpt-4o/gpt-5 models fall into this bucket.
+    _COMPLETION_TOKENS_MODELS = ("o1", "o3", "o4", "gpt-5", "gpt-4o")
+
+    @classmethod
+    def _openai_token_kwarg(cls, model: str, max_tokens: int) -> dict:
+        if any(model.startswith(prefix) for prefix in cls._COMPLETION_TOKENS_MODELS):
+            return {"max_completion_tokens": max_tokens}
+        return {"max_tokens": max_tokens}
+
+    @staticmethod
+    def _openai_strict_schema(model_cls: type) -> dict:
+        """Build an OpenAI-compatible strict JSON schema from a Pydantic model.
+
+        Strict mode requires additionalProperties:false on every object node
+        and no $defs forward-references with open dict fields.  We replace
+        dict[str, Any] fields with a typed string-to-string object (good enough
+        for params/config) and add additionalProperties:false recursively.
+        """
+        import copy
+
+        schema = copy.deepcopy(model_cls.model_json_schema())
+
+        def _harden(node: Any) -> None:
+            if not isinstance(node, dict):
+                return
+            # Collapse anyOf/allOf wrappers that contain a single real type
+            for wrapper in ("anyOf", "allOf"):
+                if wrapper in node and isinstance(node[wrapper], list):
+                    for item in node[wrapper]:
+                        if isinstance(item, dict) and item.get("type") == "object":
+                            node.update(item)
+                            del node[wrapper]
+                            break
+            if node.get("type") == "object":
+                # Strict mode requires additionalProperties:false and a 'required'
+                # array that lists every property key.
+                props = node.get("properties", {})
+                if props and "required" not in node:
+                    node["required"] = list(props.keys())
+                elif props:
+                    # Ensure all properties are listed (some may be missing).
+                    existing = set(node["required"])
+                    node["required"] = list(existing | set(props.keys()))
+                # Replace open-ended additionalProperties with false
+                if "additionalProperties" in node and node["additionalProperties"] is not False:
+                    node["additionalProperties"] = {"type": "string"}
+                else:
+                    node["additionalProperties"] = False
+                for v in props.values():
+                    _harden(v)
+            elif node.get("type") == "array":
+                _harden(node.get("items", {}))
+            for key in ("$defs", "definitions"):
+                for v in node.get(key, {}).values():
+                    _harden(v)
+
+        _harden(schema)
+        return schema
+
     def _complete_openai(
         self,
         messages: List[dict],
@@ -153,19 +213,66 @@ class LLMClient:
         if system:
             full_messages.append({"role": "system", "content": system})
         full_messages.extend(messages)
+
+        token_kwarg = self._openai_token_kwarg(self.model, max_tokens)
+
         if response_schema is not None:
-            response = client.chat.completions.parse(
-                model=self.model,
-                messages=full_messages,
-                max_tokens=max_tokens,
-                response_format=response_schema,
-            )
-            parsed = response.choices[0].message.parsed
-            return parsed.model_dump_json() if parsed is not None else ""
+            # Build a strict-compatible schema and pass it directly so the SDK
+            # doesn't generate its own (unhardened) version.
+            strict_schema = self._openai_strict_schema(response_schema)
+            response_format = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": response_schema.__name__,
+                    "strict": True,
+                    "schema": strict_schema,
+                },
+            }
+            try:
+                response = client.chat.completions.create(
+                    model=self.model,
+                    messages=full_messages,
+                    response_format=response_format,
+                    **token_kwarg,
+                )
+                raw = (response.choices[0].message.content or "").strip()
+                import json as _json
+                obj = response_schema.model_validate(_json.loads(raw))
+                return obj.model_dump_json()
+            except Exception as exc:
+                # Fall back to JSON object mode + local Pydantic validation.
+                logger.warning(
+                    "OpenAI structured output failed (%s); falling back to json_object mode",
+                    exc,
+                )
+                fallback_msgs = list(full_messages)
+                fallback_msgs.insert(
+                    0 if not any(m["role"] == "system" for m in fallback_msgs) else
+                    next(i for i, m in enumerate(fallback_msgs) if m["role"] == "system") + 1,
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Respond with a single JSON object matching the "
+                            f"{response_schema.__name__} schema. No markdown fences."
+                        ),
+                    },
+                )
+                response = client.chat.completions.create(
+                    model=self.model,
+                    messages=full_messages,
+                    response_format={"type": "json_object"},
+                    **token_kwarg,
+                )
+                raw = (response.choices[0].message.content or "").strip()
+                # Validate locally with Pydantic
+                import json as _json
+                obj = response_schema.model_validate(_json.loads(raw))
+                return obj.model_dump_json()
+
         response = client.chat.completions.create(
             model=self.model,
             messages=full_messages,
-            max_tokens=max_tokens,
+            **token_kwarg,
         )
         return response.choices[0].message.content or ""
 

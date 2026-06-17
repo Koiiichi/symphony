@@ -29,6 +29,9 @@ TaskGraph JSON schema:
   "version": "2.0",
   "goal": "<string>",
   "constraints": ["<string>", ...],
+  "verification_contract": [
+    {"id": "<claim_id>", "description": "<atomic claim to verify>", "required": true}
+  ],
   "nodes": [
     {
       "id": "<unique_id>",
@@ -53,18 +56,28 @@ FlowAction schema (use for actions and assertions arrays):
   "selector": "<CSS selector — required for click, fill, wait_for, assert_text>",
   "value": "<string — required for navigate (URL), fill (text), press (key), assert_text (expected text), assert_http_status (status code as string), assert_banner (expected text)>",
   "timeout_ms": 10000,
-  "params": {},
+  "params": {"claim_id": "<required on assertion actions>"},
   "other_action_type": "<required only when action is 'other'>"
 }
 
-IMPORTANT: Use "action" (not "type") as the field name for the action type.
+IMPORTANT ASSERTION ORDERING RULE:
+The executor runs all actions in order, then all assertions in order. After a navigate action the previous page's elements are gone.
+Therefore: place assert_text and assert_banner actions INSIDE the "actions" array immediately after the action that makes the element visible — not in the "assertions" array.
+Only put assertions that check the FINAL page state in the "assertions" array.
+Example for a multi-page flow (login → book → history):
+  actions: [navigate /index.html, fill #email, fill #password, click #loginButton, wait_for #whoami,
+            assert_text #whoami (claim_id: login_success),   ← assert HERE while still on dashboard
+            navigate /events.html, wait_for #eventsGrid, click button[data-book-id], fill #paymentToken, click #bookButton, wait_for #bookingStatus,
+            assert_text #bookingStatus (claim_id: booking_success),  ← assert HERE while still on events page
+            navigate /history.html, wait_for #historyStatus]
+  assertions: [assert_text #historyStatus (claim_id: history_visible)]  ← final page only
 
 Node type guide:
 - stack_detect: identify project stack/framework
 - service_start: start backend/frontend servers
 - ui_discovery: explore the UI to find elements/pages
 - web_flow_test: execute browser flow with actions and assertions
-- api_check: verify API endpoint behavior
+- api_check: verify API endpoint behavior — config MUST include "url", "method", and "expected_status" (the integer HTTP status you expect, e.g. 200, 201, 401, 404). Never omit expected_status. For auth checks use 401, for created use 201, for not-found use 404. For POST/PUT requests include "body": {...} with the JSON request body. Add "headers": {"Authorization": "Bearer <token>"} when the endpoint requires authentication.
 - code_patch: modify source code to fix a failure
 - retest: re-run a previous test after a patch
 - finalize: cleanup and report generation
@@ -73,8 +86,15 @@ Node type guide:
 Rules:
 - Emit ONLY valid JSON. No markdown, no commentary.
 - Every web_flow_test MUST have actions and assertions.
+- Include verification_contract with 1+ required claims derived from the user goal.
+- Every assertion must link to a claim via params.claim_id.
+- Every required claim must be linked from at least one executable assertion.
+- For api_check nodes, link to a claim via config.claim_id.
 - Use edges to express dependencies between nodes.
 - Prefer smaller, focused nodes over large monolithic ones.
+- EXCEPTION: multi-page authenticated journeys (login → navigate → interact → verify) MUST stay in a single web_flow_test node. Each web_flow_test node gets its own isolated browser context; splitting an authenticated flow across multiple nodes will lose the session and cause Unauthorized errors.
+- Every web_flow_test node's FIRST action must be a navigate to an absolute URL (the page where the flow begins).
+- If a "LIVE UI MAP" section is provided, it reflects the actual running app. Use ONLY the selectors, element IDs, and pages listed there. Do not invent selectors (e.g. do not guess '#historyList' if the map shows '#historyStatus').
 - Use the exact CSS selectors from the provided HTML context (ids, names, classes). Do NOT guess selectors.
 """
 
@@ -151,6 +171,16 @@ class LLMPlanner:
                         "TaskGraph has no web_flow_test or api_check nodes — "
                         "add at least one node that executes and asserts."
                     )
+                if not graph.verification_contract:
+                    raise ValueError(
+                        "TaskGraph has empty verification_contract — add required "
+                        "goal claims and link assertions via params.claim_id."
+                    )
+                if not any(claim.required for claim in graph.verification_contract):
+                    raise ValueError(
+                        "TaskGraph verification_contract has no required claims — "
+                        "add at least one required claim."
+                    )
                 confidence = data.get("confidence")
                 if attempt > 1:
                     logger.info("LLM planner succeeded on attempt %d", attempt)
@@ -174,7 +204,9 @@ class LLMPlanner:
                         {"role": "user", "content": (
                             f"Your response was invalid: {exc}\n"
                             "Fix the issue and return a valid TaskGraph JSON. "
-                            "Ensure all edge source/target IDs exactly match node IDs."
+                            "Ensure all edge source/target IDs exactly match node IDs. "
+                            "Include verification_contract and params.claim_id links "
+                            "for every assertion."
                         )},
                     ]
 
